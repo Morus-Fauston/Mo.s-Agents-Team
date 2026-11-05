@@ -94,6 +94,271 @@
   border-top: 1px solid #e2e5ea;
   font-size: 14px;
 }
+.tabs {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  border-bottom: 1px solid #e2e5ea;
+  margin: 16px 0;
+}
+.tabs button {
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  padding: 10px 4px;
+  color: #5f6876;
+  font-size: 14px;
+}
+.tabs button[aria-selected='true'],
+.tabs button[aria-pressed='true'] {
+  border-bottom-color: #2b67d1;
+  color: #1d4fa8;
+}
+.chatLayout {
+  display: grid;
+  grid-template-columns: 190px minmax(0, 1fr);
+  gap: 20px;
+  align-items: start;
+}
+.chatNav {
+  border-right: 1px solid #e2e5ea;
+  padding-right: 14px;
+  max-height: 75vh;
+  overflow: auto;
+  font-size: 13px;
+}
+.chatNav .tabs {
+  margin-top: 0;
+  gap: 6px;
+}
+.chatNav .tabs button {
+  font-size: 12px;
+}
+.contact {
+  display: grid;
+  gap: 6px;
+  width: 100%;
+  padding: 12px 10px;
+  margin-bottom: 6px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  text-align: left;
+  overflow-wrap: anywhere;
+  color: #1b2230;
+}
+.contact span {
+  font-size: 12px;
+  color: #5f6876;
+}
+.contact[aria-pressed='true'] {
+  background: #edf2fb;
+  border-color: #b9ccef;
+}
+.chatConversation {
+  min-width: 0;
+}
+.chatConversation h4 {
+  font-size: 16px;
+  margin: 0 0 8px;
+}
+.chatHistory {
+  max-height: 60vh;
+  overflow: auto;
+  min-height: 160px;
+  padding-right: 8px;
+}
+.chatMessage {
+  border-bottom: 1px solid #e2e5ea;
+  padding: 16px 0;
+  min-width: 0;
+}
+.chatMessage header {
+  display: flex;
+  gap: 8px 12px;
+  align-items: baseline;
+  flex-wrap: wrap;
+  font-size: 13px;
+}
+.chatMessage header span,
+.chatMessage time {
+  font-size: 12px;
+  color: #5f6876;
+}
+.markdown {
+  font-size: 14px;
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.markdown p {
+  margin: 10px 0;
+}
+.markdown pre {
+  max-width: 100%;
+  overflow: auto;
+  background: #f4f5f7;
+  border: 1px solid #e2e5ea;
+  padding: 12px;
+  border-radius: 6px;
+  line-height: 1.6;
+}
+.markdown code {
+  font-family: Consolas, 'Cascadia Code', monospace;
+  font-size: 12px;
+}
+.markdown blockquote {
+  margin: 12px 0;
+  padding-left: 12px;
+  border-left: 2px solid #c8cdd5;
+  color: #5f6876;
+}
+.markdown a {
+  color: #1d4fa8;
+}
+.tableWrap {
+  max-width: 100%;
+  overflow: auto;
+}
+.tableWrap table {
+  border-collapse: collapse;
+}
+.tableWrap th,
+.tableWrap td {
+  padding: 6px 10px;
+  border: 1px solid #d2d7de;
+  white-space: nowrap;
+}
+.markdown :global(.hljs-keyword),
+.markdown :global(.hljs-selector-tag) {
+  color: #184dad;
+}
+.markdown :global(.hljs-string),
+.markdown :global(.hljs-attr) {
+  color: #6c3b0f;
+}
+.markdown :global(.hljs-comment) {
+  color: #6a737d;
+}
+.textButton {
+  border: 0;
+  background: transparent;
+  color: #1d4fa8;
+  padding: 2px;
+  font-size: 12px;
+  text-decoration: underline;
+}
+.receipt {
+  margin-top: 10px;
+  font-size: 12px;
+  color: #5f6876;
+}
+.receipt summary {
+  cursor: pointer;
+}
+.receipt .facts {
+  margin: 12px 0;
+}
+.replyReference {
+  font-size: 12px;
+  color: #5f6876;
+  overflow-wrap: anywhere;
+}
+.referenceButton {
+  display: block;
+  max-width: 100%;
+  border: 1px solid #d2d7de;
+  border-radius: 6px;
+  background: #fff;
+  text-align: left;
+  padding: 8px 10px;
+  margin: 8px 0;
+  color: #1d4fa8;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.composer {
+  border-top: 1px solid #d2d7de;
+  padding-top: 16px;
+  margin-top: 16px;
+}
+.composer label {
+  display: grid;
+  gap: 8px;
+  font-size: 14px;
+}
+.composer textarea {
+  width: 100%;
+  min-height: 120px;
+  max-height: 320px;
+  resize: vertical;
+  border: 1px solid #c8cdd5;
+  border-radius: 6px;
+  padding: 12px;
+  font: inherit;
+  line-height: 1.7;
+}
+.composer .actions {
+  justify-content: flex-end;
+  margin-top: 12px;
+}
+.draftReference {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: start;
+  margin: 10px 0;
+  font-size: 12px;
+}
+.draftReference span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.draftReference button {
+  flex-shrink: 0;
+}
+.filePreview {
+  max-width: 100%;
+  max-height: 50vh;
+  overflow: auto;
+  background: #f4f5f7;
+  padding: 14px;
+  font:
+    13px/1.7 Consolas,
+    'Cascadia Code',
+    monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.configDialog .description {
+  overflow-wrap: anywhere;
+}
+@media (max-width: 1050px) {
+  .chatLayout {
+    grid-template-columns: 1fr;
+  }
+  .chatNav {
+    max-height: 230px;
+    border-right: 0;
+    border-bottom: 1px solid #e2e5ea;
+    padding-right: 0;
+    padding-bottom: 12px;
+  }
+  .chatNav .contact {
+    display: inline-grid;
+    width: calc(50% - 6px);
+    vertical-align: top;
+    margin-right: 6px;
+  }
+}
+@media (max-width: 640px) {
+  .chatNav .contact {
+    width: 100%;
+  }
+  .composer .actions {
+    flex-wrap: wrap;
+  }
+}
 :global(button) {
   cursor: pointer;
 }

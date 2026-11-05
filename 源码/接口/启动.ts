@@ -32,9 +32,10 @@ export async function startConsole(config: ConsoleConfiguration): Promise<Consol
   const service = new ProjectService(config.stateDirectory);
   let server: ReturnType<typeof serve> | undefined;
   let runtime: SessionRuntime | undefined;
+  const shutdown = new AbortController();
   try {
     runtime = await config.createRuntime?.(service);
-    const app = createApplication(service, config.assetsDirectory, runtime);
+    const app = createApplication(service, config.assetsDirectory, runtime, shutdown.signal);
     server = serve({ fetch: app.fetch, hostname: '127.0.0.1', port: config.port });
     const activeServer = server;
     await new Promise<void>((resolve, reject) => {
@@ -56,6 +57,7 @@ export async function startConsole(config: ConsoleConfiguration): Promise<Consol
     return {
       url,
       close() {
+        shutdown.abort();
         closing ??= closeHTTP(activeServer).finally(async () => {
           try {
             await runtime?.close();
@@ -67,6 +69,7 @@ export async function startConsole(config: ConsoleConfiguration): Promise<Consol
       },
     };
   } catch (error) {
+    shutdown.abort();
     try {
       if (server) await closeHTTP(server);
     } finally {

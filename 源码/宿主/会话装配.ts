@@ -10,6 +10,8 @@ import { ProjectError } from '../业务/错误.ts';
 import { SkillAssembly } from './Skill装配.ts';
 import { ExplicitSkillGrants } from './本次Skill许可.ts';
 import { loadNativeModules } from './原生接口.ts';
+import { CommunicationService } from '../业务/私聊服务.ts';
+import { installCommunicationTools } from './私聊工具.ts';
 import type {
   NativeAgent,
   NativeContext,
@@ -49,11 +51,13 @@ interface Binding {
   currentRequest?: RequestRecord;
 }
 export interface SessionRuntime {
+  readonly communication: CommunicationService;
   create(projectId: string, input: SessionInput): Promise<SessionRecord>;
   configuration(projectId: string, sessionId: string): unknown;
   close(): Promise<void>;
 }
 export class HostSessionRuntime implements SessionRuntime {
+  readonly communication: CommunicationService;
   private readonly ctx: NativeContext;
   private readonly projects: ProjectService;
   private readonly modules: NativeModules;
@@ -61,10 +65,15 @@ export class HostSessionRuntime implements SessionRuntime {
   private readonly handles: { agent: NativeAgent; dispose(): Promise<void> }[] = [];
   private readonly disposers: (() => void | Promise<void>)[] = [];
   private closed = false;
+  private readonly openings = new Map<string, Promise<NativeAgent>>();
   private constructor(ctx: NativeContext, projects: ProjectService, modules: NativeModules) {
     this.ctx = ctx;
     this.projects = projects;
     this.modules = modules;
+    this.communication = new CommunicationService(projects, {
+      open: (project, session) => this.open(project, session),
+      flush: (agent) => ctx.sessions.flush(agent.session),
+    });
   }
   static async start(ctx: NativeContext, projects: ProjectService): Promise<HostSessionRuntime> {
     if (!ctx.agentPresets)
@@ -92,7 +101,14 @@ export class HostSessionRuntime implements SessionRuntime {
       runtime.disposers.push(
         ctx.on('session/event', (session, event) => {
           const found = [...runtime.bindings].find(([agent]) => agent.id === session.id);
-          if (!found || event.type !== 'turn/end') return;
+          if (!found) return;
+          runtime.communication.observeOutput(
+            found[1].connection.snapshot().id,
+            found[1].session.id,
+            found[0],
+            event,
+          );
+          if (event.type !== 'turn/end') return;
           const reason = event.data.reason as
             { kind?: string; error?: { message?: string } } | undefined;
           if (reason?.kind === 'error')
@@ -102,6 +118,7 @@ export class HostSessionRuntime implements SessionRuntime {
             );
           else if (reason?.kind === 'completed')
             found[1].connection.recordSessionError(found[1].session.id, null);
+          found[1].connection.messages().notifySession(found[1].session.id);
         }),
       );
       return runtime;
@@ -147,64 +164,7 @@ export class HostSessionRuntime implements SessionRuntime {
         agentOptions: session.configuration,
         setup: async (agentCtx, agent) => {
           preparedAgent = agent;
-          await this.ctx.agentPresets!.mount(agentCtx, `mat-${role.type}`);
-          const allowed = [
-            ...basic,
-            'skill',
-            ...(role.type === 'committer' ? [] : ['web_search', 'web_fetch']),
-            ...(role.type === 'supervisor'
-              ? ['ask_user_question', 'present', 'create_worktree']
-              : []),
-          ];
-          const existing = agentCtx.tools.definitions(agent).map((tool) => tool.name);
-          agentCtx.tools.restrict({ allow: allowed.filter((name) => existing.includes(name)) });
-          agentCtx.tools.register(
-            this.modules.defineTool({
-              name: 'skill',
-              description:
-                '从当前角色适用的For MAT真实来源按需加载完整Skill。显式入口须本次用户以 $名称 指定。',
-              parameters: {
-                name: { type: 'string', required: true, description: '目录中的准确名称' },
-              },
-              output: {
-                schema: { type: 'string' },
-                render: (_args: unknown, value: string) => [{ type: 'text', text: value }],
-              },
-              execute: async (
-                args: { name: string },
-                exec: { agent: NativeAgent; signal: AbortSignal },
-              ) => {
-                const binding = this.requireBinding(exec.agent);
-                if (binding.skills !== ownedSkills)
-                  throw new ProjectError(
-                    'SKILL_CALLER_MISMATCH',
-                    'Skill工具实际调用者不属于此装配',
-                  );
-                const cwd = await this.ctx.workingDirectory.ensure(exec.agent, exec.signal);
-                const loaded = await ownedSkills.load(
-                  args.name,
-                  cwd,
-                  exec.signal,
-                  binding.explicitSkills.has(args.name),
-                );
-                binding.loadedSkills.set(args.name, {
-                  name: args.name,
-                  path: loaded.path,
-                  sha256: loaded.sha256,
-                });
-                return loaded.body;
-              },
-            }),
-          );
-          this.bindings.set(agent, {
-            connection,
-            session: { ...session, nativeSessionId: nativeId },
-            skills: ownedSkills,
-            context,
-            catalogVersion: '',
-            loadedSkills: new Map(),
-            explicitSkills: new ExplicitSkillGrants(),
-          });
+          await this.configureAgent(connection, session, ownedSkills, context, agentCtx, agent);
         },
       });
       const bound = connection.bindSession(session.id, handle.agent.id);
@@ -220,6 +180,151 @@ export class HostSessionRuntime implements SessionRuntime {
         session.id,
         error instanceof Error ? error.message : '原生会话创建失败',
       );
+      throw error;
+    }
+  }
+  private async configureAgent(
+    connection: ProjectConnection,
+    session: SessionRecord,
+    ownedSkills: SkillAssembly,
+    context: AssembledContext,
+    agentCtx: NativeContext,
+    agent: NativeAgent,
+  ): Promise<void> {
+    const role = connection.roles().find((role) => role.id === session.roleId)!;
+    await this.ctx.agentPresets!.mount(agentCtx, `mat-${role.type}`);
+    const allowed = [
+      ...basic,
+      'skill',
+      ...(role.type === 'committer' ? [] : ['web_search', 'web_fetch']),
+      ...(role.type === 'supervisor' ? ['ask_user_question', 'present', 'create_worktree'] : []),
+    ];
+    const existing = agentCtx.tools.definitions(agent).map((tool) => tool.name);
+    agentCtx.tools.restrict({ allow: allowed.filter((name) => existing.includes(name)) });
+    agentCtx.tools.register(
+      this.modules.defineTool({
+        name: 'skill',
+        description:
+          '从当前角色适用的For MAT真实来源按需加载完整Skill。显式入口须本次用户以 $名称 指定。',
+        parameters: {
+          name: { type: 'string', required: true, description: '目录中的准确名称' },
+        },
+        output: {
+          schema: { type: 'string' },
+          render: (_args: unknown, value: string) => [{ type: 'text', text: value }],
+        },
+        execute: async (
+          args: { name: string },
+          exec: { agent: NativeAgent; signal: AbortSignal },
+        ) => {
+          const binding = this.requireBinding(exec.agent);
+          if (binding.skills !== ownedSkills)
+            throw new ProjectError('SKILL_CALLER_MISMATCH', 'Skill工具实际调用者不属于此装配');
+          const cwd = await this.ctx.workingDirectory.ensure(exec.agent, exec.signal);
+          const loaded = await ownedSkills.load(
+            args.name,
+            cwd,
+            exec.signal,
+            binding.explicitSkills.has(args.name),
+          );
+          binding.loadedSkills.set(args.name, {
+            name: args.name,
+            path: loaded.path,
+            sha256: loaded.sha256,
+          });
+          return loaded.body;
+        },
+      }),
+    );
+    this.bindings.set(agent, {
+      connection,
+      session: { ...session, nativeSessionId: agent.id },
+      skills: ownedSkills,
+      context,
+      catalogVersion: '',
+      loadedSkills: new Map(),
+      explicitSkills: new ExplicitSkillGrants(),
+    });
+    installCommunicationTools(
+      agentCtx,
+      agent,
+      this.modules,
+      (caller) => {
+        const binding = this.requireBinding(caller);
+        return { connection: binding.connection, sessionId: binding.session.id };
+      },
+      this.communication,
+    );
+  }
+  async open(projectId: string, sessionId: string): Promise<NativeAgent> {
+    if (this.closed) throw new ProjectError('RUNTIME_CLOSED', '会话服务已经关闭');
+    const connection = this.projects.forProject(projectId);
+    const session = connection.session(sessionId);
+    if (session.status !== 'bound' || session.communicationState !== 'active')
+      throw new ProjectError('TARGET_CONTROLLED', '目标不是可接纳的活跃入口，不因聊天恢复');
+    const existing = [...this.bindings].find(
+      ([, binding]) => binding.connection === connection && binding.session.id === sessionId,
+    )?.[0];
+    if (existing) {
+      this.requireBinding(existing);
+      return existing;
+    }
+    const key = `${projectId}:${sessionId}`;
+    const pending = this.openings.get(key);
+    if (pending) return pending;
+    const opening = this.restore(connection, session);
+    this.openings.set(key, opening);
+    void opening
+      .finally(() => {
+        if (this.openings.get(key) === opening) this.openings.delete(key);
+      })
+      .catch(() => {});
+    return opening;
+  }
+  private async restore(
+    connection: ProjectConnection,
+    session: SessionRecord,
+  ): Promise<NativeAgent> {
+    if (!session.nativeSessionId || !session.skillSourceRoot)
+      throw new ProjectError(
+        'SESSION_RESTORE_INCOMPLETE',
+        '原会话缺少原生身份或创建时Skill来源，不猜测恢复配置',
+      );
+    const role = connection.roles().find((role) => role.id === session.roleId)!;
+    const context = assembleContext(connection.snapshot(), role, session, session.cwd);
+    const skills = new SkillAssembly(
+      this.ctx,
+      this.modules,
+      session.skillSourceRoot,
+      session.roleType,
+    );
+    let prepared: NativeAgent | undefined;
+    let handle: { agent: NativeAgent; dispose(): Promise<void> } | undefined;
+    try {
+      await skills.catalog(session.cwd);
+      handle = await this.ctx.agents.resume({
+        resumeSessionId: session.nativeSessionId,
+        setup: async (agentCtx, agent) => {
+          prepared = agent;
+          const selected = agent.session
+            .snapshotEvents()
+            .findLast((event) => event.type === 'agent-preset/selected')?.data.agentPreset;
+          if (selected !== `mat-${session.roleType}`)
+            throw new ProjectError(
+              'RESTORE_PRESET_MISMATCH',
+              '历史实际预设与角色绑定不一致，拒绝静默改绑',
+            );
+          await this.configureAgent(connection, session, skills, context, agentCtx, agent);
+        },
+      });
+      if (handle.agent.id !== session.nativeSessionId)
+        throw new ProjectError('RESTORE_ID_MISMATCH', '恢复后的原生会话身份与持久记录不一致');
+      this.handles.push(handle);
+      return handle.agent;
+    } catch (error) {
+      if (prepared) this.bindings.delete(prepared);
+      await handle?.dispose();
+      await skills.dispose();
       throw error;
     }
   }
@@ -240,10 +345,18 @@ export class HostSessionRuntime implements SessionRuntime {
     const excluded = new Set(['agent-instructions', 'skill-catalog', 'skill-invocation']);
     for (const message of input.agent.inbox.nextStep)
       if (excluded.has(String(message.source.kind))) input.agent.inbox.remove(message.id);
-    const messages = decision.messages.filter(
+    const filtered = decision.messages.filter(
       (message) => !excluded.has(String(message.source.kind)),
     );
-    binding.explicitSkills.accept(input.turn, messages);
+    const admitted = await this.communication.admit(
+      binding.connection.snapshot().id,
+      binding.session.id,
+      input.agent,
+      input.turn,
+      filtered,
+    );
+    const messages = admitted.messages;
+    binding.explicitSkills.accept(input.turn, admitted.grants);
     const version = createHash('sha256')
       .update(context.version)
       .update(catalog.version)
@@ -327,6 +440,13 @@ export class HostSessionRuntime implements SessionRuntime {
         startedAt: new Date().toISOString(),
       };
       binding.connection.saveRequest(binding.currentRequest);
+      this.communication.noteEntered(
+        binding.connection.snapshot().id,
+        binding.session.id,
+        agent,
+        frame.attemptId,
+        binding.currentRequest.id,
+      );
     } else if (frame.type === 'end' && binding.currentRequest) {
       const record = binding.currentRequest;
       const event =
@@ -370,12 +490,14 @@ export class HostSessionRuntime implements SessionRuntime {
       requests: connection.requests(sessionId),
       nativeLoaded: !!native,
       usageAvailability: '每次请求独立保存；null表示宿主未提供',
-      unavailableActions: ['派工', 'Chat', '审计', '执行控制', '交接保存'],
+      unavailableActions: ['派工', '审计', '执行控制', '交接保存'],
     };
   }
   async close() {
     if (this.closed) return;
     this.closed = true;
+    await this.communication.close();
+    await Promise.allSettled([...this.openings.values()]);
     for (const dispose of this.disposers.splice(0).reverse()) await dispose();
     for (const handle of this.handles.splice(0).reverse()) await handle.dispose();
     for (const binding of this.bindings.values()) await binding.skills.dispose();

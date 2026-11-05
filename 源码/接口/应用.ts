@@ -8,11 +8,15 @@ import { roleInputSchema, roleUpdateSchema } from '../契约/角色.ts';
 import { sessionInputSchema } from '../契约/会话.ts';
 import { resolveSkillSources } from '../业务/Skill来源.ts';
 import type { SessionRuntime } from '../宿主/会话装配.ts';
+import { streamSSE } from 'hono/streaming';
+import { chatInputSchema } from '../契约/私聊.ts';
+import { checkReferences, readReferenceText } from '../业务/引用文件.ts';
 const attachment = z.object({ root: z.string().min(1) }).strict();
 export function createApplication(
   service: ProjectService,
   assetsDirectory?: string,
   runtime?: SessionRuntime,
+  shutdown?: AbortSignal,
 ): Hono {
   const app = new Hono();
   app.use('*', async (c, next) => {
@@ -28,7 +32,10 @@ export function createApplication(
     if (error instanceof ProjectError)
       return c.json({ code: error.code, message: error.message }, 409);
     if (error instanceof z.ZodError || error instanceof SyntaxError)
-      return c.json({ code: 'INVALID_INPUT', message: '请核对项目根、名称及主管执行配置' }, 400);
+      return c.json(
+        { code: 'INVALID_INPUT', message: '输入不合法，请核对当前表单或消息参数' },
+        400,
+      );
     return c.json({ code: 'OPERATION_FAILED', message: error.message }, 400);
   });
   app.get('/api/projects', (c) => c.json(service.list()));
@@ -122,6 +129,114 @@ export function createApplication(
       requests: connection.requests(session),
       message: '仅查询持久记录；未运行的实际配置不推定已生效',
     });
+  });
+  app.get('/api/projects/:project/contacts', (c) =>
+    c.json(
+      service
+        .forProject(c.req.param('project'))
+        .messages()
+        .contacts({ kind: 'user' }, c.req.query('role')),
+    ),
+  );
+  app.get('/api/projects/:project/conversations', (c) =>
+    c.json(service.forProject(c.req.param('project')).messages().conversations({ kind: 'user' })),
+  );
+  app.get('/api/projects/:project/conversations/:conversation', (c) =>
+    c.json(
+      service
+        .forProject(c.req.param('project'))
+        .messages()
+        .history({ kind: 'user' }, z.uuid().parse(c.req.param('conversation'))),
+    ),
+  );
+  app.post('/api/projects/:project/messages', async (c) => {
+    const input = chatInputSchema.parse(await c.req.json());
+    if (!runtime)
+      throw new ProjectError('HOST_UNAVAILABLE', '当前宿主未连接通信投递服务，消息未保存');
+    return c.json(
+      await runtime.communication.send(c.req.param('project'), { kind: 'user' }, input),
+      201,
+    );
+  });
+  app.post('/api/projects/:project/messages/:message/retry', async (c) => {
+    if (!runtime) throw new ProjectError('HOST_UNAVAILABLE', '当前宿主未连接，不能重试投递');
+    return c.json(
+      await runtime.communication.retry(
+        c.req.param('project'),
+        { kind: 'user' },
+        z.uuid().parse(c.req.param('message')),
+      ),
+    );
+  });
+  app.get('/api/projects/:project/messages/:message/references/:index', (c) => {
+    const connection = service.forProject(c.req.param('project'));
+    const saved = connection.messages().get(z.uuid().parse(c.req.param('message')));
+    connection.messages().history({ kind: 'user' }, saved.message.conversationId);
+    const index = z.coerce.number().int().nonnegative().parse(c.req.param('index'));
+    const reference = saved.message.references[index];
+    if (!reference) throw new ProjectError('REFERENCE_NOT_FOUND', '此消息没有指定的引用');
+    if (reference.snippet !== undefined)
+      return c.json({
+        path: reference.path,
+        startLine: reference.startLine ?? null,
+        endLine: reference.endLine ?? null,
+        source: 'saved-snippet',
+        content: reference.snippet,
+      });
+    const actor =
+      saved.message.sender.kind === 'user'
+        ? { kind: 'user' as const }
+        : { kind: 'session' as const, sessionId: saved.message.sender.sessionId! };
+    const checked = checkReferences(connection, actor, saved.receipt.targetSessionId ?? 'user', [
+      reference,
+    ])[0]!;
+    return c.json({
+      path: checked.path,
+      startLine: checked.startLine ?? null,
+      endLine: checked.endLine ?? null,
+      source: checked.snippet === undefined ? 'current-file' : 'saved-snippet',
+      content: checked.snippet ?? readReferenceText(checked),
+    });
+  });
+  app.get('/api/projects/:project/events/cursor', (c) =>
+    c.json({ cursor: service.forProject(c.req.param('project')).messages().latestEventSeq() }),
+  );
+  app.get('/api/projects/:project/events', (c) => {
+    const catalog = service.forProject(c.req.param('project')).messages();
+    let cursor = z.coerce
+      .number()
+      .int()
+      .nonnegative()
+      .max(Number.MAX_SAFE_INTEGER)
+      .parse(c.req.header('last-event-id') ?? c.req.query('after') ?? 0);
+    return streamSSE(
+      c,
+      async (stream) => {
+        await stream.writeSSE({ event: 'ready', data: JSON.stringify({ cursor }), retry: 1500 });
+        let heartbeat = Date.now();
+        while (!stream.aborted && !shutdown?.aborted) {
+          for (const event of catalog.events(cursor)) {
+            await stream.writeSSE({
+              id: String(event.seq),
+              event: 'change',
+              data: JSON.stringify(event),
+            });
+            cursor = event.seq;
+          }
+          if (Date.now() - heartbeat > 15000) {
+            await stream.writeSSE({ event: 'heartbeat', data: '{}' });
+            heartbeat = Date.now();
+          }
+          await stream.sleep(250);
+        }
+      },
+      async (error, stream) => {
+        if (!stream.aborted && !shutdown?.aborted)
+          await stream
+            .writeSSE({ event: 'unavailable', data: JSON.stringify({ message: error.message }) })
+            .catch(() => {});
+      },
+    );
   });
   app.all('/api/*', (c) => c.json({ code: 'NOT_FOUND', message: '接口不存在' }, 404));
   if (assetsDirectory) {

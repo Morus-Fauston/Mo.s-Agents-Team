@@ -20,6 +20,7 @@ import type { RoleInput, RegisteredRole, RoleUpdate } from '../契约/角色.ts'
 import type { SessionInput, SessionRecord } from '../契约/会话.ts';
 import type { RequestRecord } from '../契约/装配.ts';
 import { RequestCatalog } from '../存储/请求记录.ts';
+import { MessageCatalog, migrateMessages } from '../存储/消息记录.ts';
 export { ProjectError } from './错误.ts';
 export type {
   ExecutionConfiguration,
@@ -125,7 +126,7 @@ function view(db: DatabaseSync, root: string): ProjectView {
 }
 function migrate(db: DatabaseSync): void {
   const version = Number(db.prepare('PRAGMA user_version').get()?.user_version);
-  if (version > 3) throw new ProjectError('FUTURE_SCHEMA', '数据库版本高于当前软件，拒绝降级写入');
+  if (version > 4) throw new ProjectError('FUTURE_SCHEMA', '数据库版本高于当前软件，拒绝降级写入');
   if (version === 0) {
     db.exec(`CREATE TABLE project(singleton INTEGER PRIMARY KEY CHECK(singleton=1),id TEXT NOT NULL UNIQUE,name TEXT NOT NULL,attached INTEGER NOT NULL DEFAULT 0 CHECK(attached IN(0,1)),started INTEGER NOT NULL DEFAULT 0 CHECK(started IN(0,1)));
       CREATE TABLE role(id TEXT PRIMARY KEY,code TEXT NOT NULL UNIQUE,type TEXT NOT NULL,configuration TEXT NOT NULL);
@@ -134,6 +135,7 @@ function migrate(db: DatabaseSync): void {
   }
   if (version < 2) migrateRoles(db);
   if (version < 3) migrateSessions(db);
+  if (version < 4) migrateMessages(db);
 }
 export function initializeProject(input: InitializeInput): ProjectView {
   if (!input || typeof input.name !== 'string' || !input.name.trim() || input.name.length > 160)
@@ -255,6 +257,7 @@ export function readProject(inputRoot: string): ProjectView {
   }
 }
 export interface ProjectConnection {
+  messages(): MessageCatalog;
   skillSourceRoot(): string | null;
   setSkillSourceRoot(root: string): void;
   requests(sessionId: string): RequestRecord[];
@@ -269,6 +272,7 @@ export interface ProjectConnection {
   bindSession(id: string, nativeSessionId: string): SessionRecord;
   failSession(id: string, error: string): SessionRecord;
   recordSessionError(id: string, error: string | null): void;
+  setCommunicationState(id: string, state: SessionRecord['communicationState']): void;
   closeSession(id: string): void;
   close(): void;
 }
@@ -285,7 +289,7 @@ export function connectProject(inputRoot: string): ProjectConnection {
   try {
     db.exec('PRAGMA foreign_keys=ON');
     const version = Number(db.prepare('PRAGMA user_version').get()?.user_version);
-    if (version < 1 || version > 3)
+    if (version < 1 || version > 4)
       throw new ProjectError('SCHEMA_MISMATCH', '项目数据库版本不匹配，请先核对升级与初始化结果');
     db.exec('PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE');
     try {
@@ -300,10 +304,15 @@ export function connectProject(inputRoot: string): ProjectConnection {
     const roles = new RoleCatalog(db, root);
     const sessions = new SessionCatalog(db, roles);
     const requests = new RequestCatalog(db);
+    const messages = new MessageCatalog(db, sessions, roles, view(db, root).id);
     const requireOpen = () => {
       if (closed) throw new ProjectError('CONNECTION_CLOSED', '项目连接已经关闭');
     };
     return {
+      messages() {
+        requireOpen();
+        return messages;
+      },
       skillSourceRoot() {
         requireOpen();
         const row = db.prepare('SELECT skill_source_root FROM project WHERE singleton=1').get();
@@ -362,6 +371,10 @@ export function connectProject(inputRoot: string): ProjectConnection {
       recordSessionError(id, error) {
         requireOpen();
         sessions.executionError(id, error);
+      },
+      setCommunicationState(id, state) {
+        requireOpen();
+        sessions.communicationState(id, state);
       },
       closeSession(id) {
         requireOpen();

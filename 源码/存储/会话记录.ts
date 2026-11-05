@@ -35,6 +35,7 @@ export class SessionCatalog {
       nativeSessionId: row.native_session_id === null ? null : String(row.native_session_id),
       status: String(row.status),
       error: row.error === null ? null : String(row.error),
+      communicationState: String(row.communication_state ?? 'active'),
       addresses: {
         readable: `${String(row.role_code)}#${Number(row.ordinal)}`,
         numeric: `${String(row.role_id)}#${Number(row.ordinal)}`,
@@ -105,6 +106,12 @@ export class SessionCatalog {
   executionError(id: string, error: string | null): void {
     this.get(id);
     this.db.prepare('UPDATE session SET error=? WHERE id=?').run(error, id);
+  }
+  communicationState(id: string, state: SessionRecord['communicationState']): void {
+    this.get(id);
+    if (!['active', 'paused', 'terminated', 'archived'].includes(state))
+      throw new ProjectError('INVALID_COMMUNICATION_STATE', '无效的通信门禁状态');
+    this.db.prepare('UPDATE session SET communication_state=? WHERE id=?').run(state, id);
   }
   close(id: string): void {
     this.get(id);

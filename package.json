@@ -1,7 +1,7 @@
 {
   "name": "@mos/agents-team",
   "description": "Project initialization and local console for Mo's Agents Team.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "type": "module",
   "engines": {

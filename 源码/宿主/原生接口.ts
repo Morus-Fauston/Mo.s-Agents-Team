@@ -9,15 +9,20 @@ export interface NativeEvent {
   type: string;
   seq: number;
   data: Record<string, unknown>;
+  surfaceOp?: unknown;
 }
 export interface NativeAgent {
   id: string;
   ctx: NativeContext;
   status: string;
+  steer(message: NativeMessage): void;
+  inject(message: NativeMessage): void;
+  whenIdle(): Promise<void>;
   session: {
     deriveMessages(): NativeMessage[];
     requestHeader(): { config: Record<string, unknown>; tools?: { name: string }[] } | undefined;
     eventAt(seq: number): NativeEvent | undefined;
+    snapshotEvents(): NativeEvent[];
   };
   inbox: { nextStep: NativeMessage[]; remove(id: string): unknown };
 }
@@ -72,6 +77,7 @@ export interface NativeContext {
     definitions(scope?: NativeAgent): ToolDefinition[];
   };
   workingDirectory: { ensure(agent: NativeAgent, signal?: AbortSignal): Promise<string> };
+  sessions: { flush(session: NativeAgent['session']): Promise<boolean> };
   agentPresets?: {
     register(definition: {
       id: string;
@@ -89,6 +95,10 @@ export interface NativeContext {
       sessionId: string;
       meta: { cwd: string };
       agentOptions: ExecutionConfiguration;
+      setup: (ctx: NativeContext, agent: NativeAgent) => Promise<void>;
+    }): Promise<{ agent: NativeAgent; dispose(): Promise<void> }>;
+    resume(options: {
+      resumeSessionId: string;
       setup: (ctx: NativeContext, agent: NativeAgent) => Promise<void>;
     }): Promise<{ agent: NativeAgent; dispose(): Promise<void> }>;
   };

@@ -1,4 +1,4 @@
-import { StrictMode, useState } from 'react';
+import { StrictMode, useState, lazy, Suspense } from 'react';
 import type { FormEvent } from 'react';
 import { createRoot } from 'react-dom/client';
 import { BrowserRouter, Link, Route, Routes, useParams } from 'react-router';
@@ -16,6 +16,7 @@ import type { ProjectView } from '../源码/契约/项目';
 import styles from './工作台.module.css';
 import { request } from './请求';
 import { RoleAndSessionPanel } from './角色与会话';
+const ChatPanel = lazy(() => import('./私聊').then((module) => ({ default: module.ChatPanel })));
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 function useProjects() {
   return useQuery({
@@ -119,6 +120,7 @@ function CreateDialog({ mode }: { mode: 'create' | 'attach' }) {
   );
 }
 function ProjectDetails({ project }: { project: ProjectView }) {
+  const [view, setView] = useState<'roles' | 'chat'>('roles');
   return (
     <section className={styles.details}>
       <div className={styles.sectionHeader}>
@@ -133,7 +135,31 @@ function ProjectDetails({ project }: { project: ProjectView }) {
         <dt>共用规范</dt>
         <dd>{project.paths.team}</dd>
       </dl>
-      <RoleAndSessionPanel key={project.id} project={project} />
+      <div className={styles.tabs} role="tablist" aria-label="项目视图">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={view === 'roles'}
+          onClick={() => setView('roles')}
+        >
+          角色与会话
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={view === 'chat'}
+          onClick={() => setView('chat')}
+        >
+          私聊
+        </button>
+      </div>
+      {view === 'roles' ? (
+        <RoleAndSessionPanel key={project.id} project={project} />
+      ) : (
+        <Suspense fallback={<p role="status">正在载入私聊…</p>}>
+          <ChatPanel key={project.id} project={project} />
+        </Suspense>
+      )}
     </section>
   );
 }

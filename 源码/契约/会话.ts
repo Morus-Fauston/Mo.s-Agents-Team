@@ -23,6 +23,7 @@ export const sessionSchema = z.object({
   nativeSessionId: z.string().nullable(),
   status: z.enum(['creating', 'bound', 'failed', 'closed']),
   error: z.string().nullable(),
+  communicationState: z.enum(['active', 'paused', 'terminated', 'archived']),
   addresses: z.object({ readable: z.string(), numeric: z.string() }),
 });
 export type SessionInput = z.infer<typeof sessionInputSchema>;

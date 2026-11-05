@@ -14,7 +14,15 @@ interface PluginConfiguration {
   stateDirectory?: string;
   port?: number;
 }
-export const inject = ['agents', 'tools', 'loader', 'workingDirectory', 'agentPresets', 'sessions'];
+export const inject = [
+  'agents',
+  'tools',
+  'loader',
+  'workingDirectory',
+  'agentPresets',
+  'sessions',
+  'goals',
+];
 export function apply(ctx: PluginContext & NativeContext, config: PluginConfiguration = {}): void {
   ctx.effect(() => {
     const state =

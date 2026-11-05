@@ -61,6 +61,8 @@ export interface TicketExecutionScope {
   checklistIds: string[];
   delegationId?: string;
   reviewId?: string;
+  allowWrite?: boolean;
+  cwd?: string;
 }
 const stamp = () => new Date().toISOString();
 function omit<T extends object, K extends keyof T>(value: T, ...keys: K[]): Omit<T, K> {
@@ -144,7 +146,8 @@ export class WorkbenchCatalog {
       !['developer', 'investigator'].includes(author.roleType ?? '') ||
       !scope ||
       scope.ticketId !== ticketId ||
-      scope.kind === 'review'
+      scope.kind === 'review' ||
+      scope.allowWrite === false
     )
       throw new ProjectError(
         'CURRENT_EXECUTION_REQUIRED',

@@ -122,7 +122,7 @@ export const feedbackInputSchema = operationSchema
   })
   .strict();
 export const authorSchema = z.object({
-  kind: z.enum(['user', 'session']),
+  kind: z.enum(['user', 'session', 'system']),
   sessionId: z.string().nullable(),
   roleId: z.string().nullable(),
   roleCode: z.string().nullable(),

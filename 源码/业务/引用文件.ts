@@ -24,6 +24,10 @@ export function checkReferences(
     project.root,
     ...(sender ? [sender.cwd] : []),
     ...(recipient ? [recipient.cwd] : []),
+    ...[sender, recipient].flatMap((session) => {
+      const execution = session && connection.executions().currentForSession(session.id);
+      return execution ? [execution.cwd] : [];
+    }),
   ].map((root) => realpathSync(root));
   return references.map((reference) => {
     try {

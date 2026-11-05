@@ -107,6 +107,46 @@ export function createApplication(
   app.get('/api/projects/:project/sessions', (c) =>
     c.json(service.forProject(c.req.param('project')).sessions()),
   );
+  app.get('/api/projects/:project/executions', (c) => {
+    const project = c.req.param('project');
+    return c.json(
+      runtime?.dispatch
+        ? runtime.dispatch.query(project)
+        : service.forProject(project).executions().list(),
+    );
+  });
+  app.get('/api/projects/:project/executions/:execution', (c) => {
+    const project = c.req.param('project'),
+      id = z.uuid().parse(c.req.param('execution'));
+    if (runtime?.dispatch) return c.json(runtime.dispatch.query(project, id));
+    const connection = service.forProject(project),
+      catalog = connection.executions(),
+      record = catalog.get(id);
+    return c.json({
+      record,
+      steps: catalog.steps(id),
+      events: catalog.events(id),
+      session: record.sessionId ? connection.session(record.sessionId) : null,
+      native: {
+        loaded: false,
+        status: null,
+        cwd: null,
+        selection: null,
+        goal: null,
+        lastGoalSnapshot: record.goalSnapshot,
+        goalError: null,
+      },
+      requests: record.sessionId
+        ? connection.requests(record.sessionId).filter((request) => request.executionId === id)
+        : [],
+      materials: connection
+        .workbench()
+        .materialDomains(record.ticketId)
+        .filter((domain) => domain.referenceId === id),
+      unavailableActions: ['当前宿主未连接；只显示持久快照，不打开原会话'],
+      coordinationBasis: '持久记录不是外部作业停稳证明',
+    });
+  });
   app.post('/api/projects/:project/sessions', async (c) => {
     if (!runtime)
       throw new ProjectError('HOST_UNAVAILABLE', '当前宿主未连接会话装配服务，不创建替代执行器');

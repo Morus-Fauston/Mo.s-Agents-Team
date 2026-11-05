@@ -11,6 +11,8 @@ import { SkillAssembly } from './Skill装配.ts';
 import { ExplicitSkillGrants } from './本次Skill许可.ts';
 import { loadNativeModules } from './原生接口.ts';
 import { CommunicationService } from '../业务/私聊服务.ts';
+import { DispatchService } from '../业务/派工服务.ts';
+import { installExecutionTools } from './执行工具.ts';
 import { installCommunicationTools } from './私聊工具.ts';
 import { installWorkbenchTools } from './工作台工具.ts';
 import type {
@@ -50,15 +52,18 @@ interface Binding {
   loadedSkills: Map<string, { name: string; path: string; sha256: string }>;
   explicitSkills: ExplicitSkillGrants;
   currentRequest?: RequestRecord;
+  execution?: { executionId: string; version: string };
 }
 export interface SessionRuntime {
   readonly communication: CommunicationService;
+  readonly dispatch?: DispatchService;
   create(projectId: string, input: SessionInput): Promise<SessionRecord>;
   configuration(projectId: string, sessionId: string): unknown;
   close(): Promise<void>;
 }
 export class HostSessionRuntime implements SessionRuntime {
   readonly communication: CommunicationService;
+  readonly dispatch: DispatchService;
   private readonly ctx: NativeContext;
   private readonly projects: ProjectService;
   private readonly modules: NativeModules;
@@ -74,6 +79,24 @@ export class HostSessionRuntime implements SessionRuntime {
     this.communication = new CommunicationService(projects, {
       open: (project, session) => this.open(project, session),
       flush: (agent) => ctx.sessions.flush(agent.session),
+    });
+    this.dispatch = new DispatchService(projects, {
+      create: (project, input, reserved) => this.create(project, input, reserved),
+      open: (project, session) => this.open(project, session),
+      peek: (project, session) => this.peek(project, session),
+      directory: (agent) => ctx.workingDirectory.get(agent.session),
+      ensureDirectory: (agent) => ctx.workingDirectory.ensure(agent),
+      setDirectory: (agent, cwd) => ctx.workingDirectory.set(agent, cwd),
+      getGoal: (agent) => {
+        if (!ctx.goals) throw new ProjectError('HOST_GOALS_UNAVAILABLE', '宿主未装配原生Goal服务');
+        return ctx.goals.get(agent);
+      },
+      createGoal: (agent, input) => {
+        if (!ctx.goals) throw new ProjectError('HOST_GOALS_UNAVAILABLE', '宿主未装配原生Goal服务');
+        return ctx.goals.create(agent, input);
+      },
+      flush: (agent) => ctx.sessions.flush(agent.session),
+      notify: (project, input) => this.communication.sendSystem(project, input),
     });
   }
   static async start(ctx: NativeContext, projects: ProjectService): Promise<HostSessionRuntime> {
@@ -103,6 +126,12 @@ export class HostSessionRuntime implements SessionRuntime {
         ctx.on('session/event', (session, event) => {
           const found = [...runtime.bindings].find(([agent]) => agent.id === session.id);
           if (!found) return;
+          runtime.dispatch.observe(
+            found[1].connection.snapshot().id,
+            found[1].session.id,
+            found[0],
+            event,
+          );
           runtime.communication.observeOutput(
             found[1].connection.snapshot().id,
             found[1].session.id,
@@ -120,6 +149,33 @@ export class HostSessionRuntime implements SessionRuntime {
           else if (reason?.kind === 'completed')
             found[1].connection.recordSessionError(found[1].session.id, null);
           found[1].connection.messages().notifySession(found[1].session.id);
+        }),
+      );
+      runtime.disposers.push(
+        ctx.on('agent/error', (input) => {
+          const binding = runtime.bindings.get(input.agent);
+          if (!binding) return;
+          binding.connection.recordSessionError(
+            binding.session.id,
+            '原生会话报告异常；原始错误见DSH会话记录，未自动换模',
+          );
+          runtime.dispatch.hostError(
+            binding.connection.snapshot().id,
+            binding.session.id,
+            input.agent,
+            input,
+          );
+        }),
+      );
+      runtime.disposers.push(
+        ctx.on('goal/changed', ({ agent }) => {
+          const binding = runtime.bindings.get(agent);
+          if (binding)
+            runtime.dispatch.goalObserved(
+              binding.connection.snapshot().id,
+              binding.session.id,
+              agent,
+            );
         }),
       );
       return runtime;
@@ -141,7 +197,11 @@ export class HostSessionRuntime implements SessionRuntime {
       throw new ProjectError('MAT_BINDING_MISMATCH', '持久会话绑定与实际调用者不一致');
     return binding;
   }
-  async create(projectId: string, input: SessionInput): Promise<SessionRecord> {
+  async create(
+    projectId: string,
+    input: SessionInput,
+    onReserved?: (session: SessionRecord) => void,
+  ): Promise<SessionRecord> {
     if (this.closed) throw new ProjectError('RUNTIME_CLOSED', '会话装配服务已经关闭');
     const connection = this.projects.forProject(projectId);
     const role = connection.roles().find((r) => r.id === input.roleId);
@@ -154,6 +214,7 @@ export class HostSessionRuntime implements SessionRuntime {
     let handle: { agent: NativeAgent; dispose(): Promise<void> } | undefined;
     let preparedAgent: NativeAgent | undefined;
     try {
+      onReserved?.(session);
       const context = assembleContext(connection.snapshot(), role, session, session.cwd);
       skills = new SkillAssembly(this.ctx, this.modules, source, role.type);
       await skills.catalog(session.cwd);
@@ -260,6 +321,25 @@ export class HostSessionRuntime implements SessionRuntime {
       const binding = this.requireBinding(caller);
       return { connection: binding.connection, sessionId: binding.session.id };
     });
+    installExecutionTools(
+      agentCtx,
+      agent,
+      this.modules,
+      role.type,
+      (caller) => {
+        const binding = this.requireBinding(caller);
+        return { connection: binding.connection, sessionId: binding.session.id };
+      },
+      this.dispatch,
+    );
+  }
+  peek(projectId: string, sessionId: string): NativeAgent | undefined {
+    const agent = [...this.bindings].find(
+      ([, binding]) =>
+        binding.connection.snapshot().id === projectId && binding.session.id === sessionId,
+    )?.[0];
+    if (agent) this.requireBinding(agent);
+    return agent;
   }
   async open(projectId: string, sessionId: string): Promise<NativeAgent> {
     if (this.closed) throw new ProjectError('RUNTIME_CLOSED', '会话服务已经关闭');
@@ -407,6 +487,22 @@ export class HostSessionRuntime implements SessionRuntime {
     }
     binding.context = context;
     binding.catalogVersion = catalog.version;
+    const execution = this.dispatch.context(
+      binding.connection.snapshot().id,
+      binding.session.id,
+      cwd,
+    );
+    if (execution)
+      binding.execution = { executionId: execution.executionId, version: execution.version };
+    else delete binding.execution;
+    if (
+      execution &&
+      input.agent.session
+        .deriveMessages()
+        .findLast((message) => message.source.kind === 'mat-execution-context')?.source.version !==
+        execution.version
+    )
+      messages.push(execution.message);
     return { ...decision, messages };
   }
   private trackRequest(
@@ -443,8 +539,19 @@ export class HostSessionRuntime implements SessionRuntime {
         status: 'started',
         error: null,
         startedAt: new Date().toISOString(),
+        ...(binding.execution
+          ? {
+              executionId: binding.execution.executionId,
+              executionContextVersion: binding.execution.version,
+            }
+          : {}),
       };
       binding.connection.saveRequest(binding.currentRequest);
+      this.dispatch.requestObserved(
+        binding.connection.snapshot().id,
+        binding.session.id,
+        binding.currentRequest.id,
+      );
       this.communication.noteEntered(
         binding.connection.snapshot().id,
         binding.session.id,
@@ -478,6 +585,11 @@ export class HostSessionRuntime implements SessionRuntime {
       if (record.status === 'failed')
         record.error = '宿主请求未完成，原始错误见关联DSH会话；未自动换模';
       binding.connection.saveRequest(record);
+      this.dispatch.requestObserved(
+        binding.connection.snapshot().id,
+        binding.session.id,
+        record.id,
+      );
     }
   }
   configuration(projectId: string, sessionId: string) {
@@ -495,12 +607,13 @@ export class HostSessionRuntime implements SessionRuntime {
       requests: connection.requests(sessionId),
       nativeLoaded: !!native,
       usageAvailability: '每次请求独立保存；null表示宿主未提供',
-      unavailableActions: ['派工', '审计', '执行控制', '交接保存'],
+      unavailableActions: ['审计', '执行控制', '交接保存'],
     };
   }
   async close() {
     if (this.closed) return;
     this.closed = true;
+    await this.dispatch.close();
     await this.communication.close();
     await Promise.allSettled([...this.openings.values()]);
     for (const dispose of this.disposers.splice(0).reverse()) await dispose();

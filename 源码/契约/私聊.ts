@@ -20,7 +20,7 @@ export const chatInputSchema = z
 export type ChatInput = z.input<typeof chatInputSchema>;
 export type ChatActor = { kind: 'user' } | { kind: 'session'; sessionId: string };
 const participantSchema = z.object({
-  kind: z.enum(['user', 'session']),
+  kind: z.enum(['user', 'session', 'system']),
   sessionId: z.string().nullable(),
   roleId: z.string().nullable(),
   roleCode: z.string().nullable(),

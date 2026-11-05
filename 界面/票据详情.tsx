@@ -11,6 +11,7 @@ import { stateLabels, logTypeLabels, importanceLabels } from './票据状态';
 import { WorkbenchForm, text, lines, VerificationSelect } from './工作台表单';
 import type { WorkbenchCommand } from './工作台表单';
 import { request } from './请求';
+import { ExecutionObservation } from './执行观察';
 import styles from './工作台.module.css';
 function Markdown({ content }: { content: string }) {
   return (
@@ -716,7 +717,7 @@ export function TicketDetails({
   run: WorkbenchCommand;
 }) {
   const [view, setView] = useState<
-      'requirements' | 'checklist' | 'logs' | 'materials' | 'revisions'
+      'requirements' | 'checklist' | 'logs' | 'materials' | 'revisions' | 'execution'
     >('requirements'),
     base = `/api/projects/${projectId}`,
     path = base + `/tickets/${ticketId}`;
@@ -750,6 +751,7 @@ export function TicketDetails({
             ['checklist', 'Checklist'],
             ['logs', 'Log'],
             ['materials', '材料'],
+            ['execution', '执行观察'],
             ['revisions', '修订历史'],
           ] as const
         ).map(([key, label]) => (
@@ -780,9 +782,7 @@ export function TicketDetails({
               .join('、') || '无'}
           </p>
           <div className={styles.actions}>
-            <button type="button" className={styles.button} disabled>
-              派工（待接入）
-            </button>
+            <p>正式派工请通过 Chat 向主管提出；此处只读观察，不代替主管身份。</p>
             <button type="button" className={styles.button} disabled>
               独审（待接入）
             </button>
@@ -795,6 +795,9 @@ export function TicketDetails({
       {view === 'checklist' && <Checklist ticket={ticket} base={base} run={run} />}
       {view === 'logs' && <Logs path={path} projectId={projectId} run={run} />}
       {view === 'materials' && <Materials path={path} projectId={projectId} />}
+      {view === 'execution' && (
+        <ExecutionObservation projectId={projectId} executionId={ticket.currentExecution} />
+      )}
       {view === 'revisions' && <Revisions path={path} projectId={projectId} />}
     </section>
   );

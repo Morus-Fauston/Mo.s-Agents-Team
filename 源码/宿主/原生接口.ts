@@ -1,4 +1,5 @@
 import type { ExecutionConfiguration } from '../契约/项目.ts';
+import type { NativeGoalView } from '../契约/执行.ts';
 export interface NativeMessage {
   id: string;
   role: string;
@@ -15,6 +16,10 @@ export interface NativeAgent {
   id: string;
   ctx: NativeContext;
   status: string;
+  model: {
+    current(): ExecutionConfiguration | undefined;
+    select(configuration: ExecutionConfiguration): unknown;
+  };
   steer(message: NativeMessage): void;
   inject(message: NativeMessage): void;
   whenIdle(): Promise<void>;
@@ -65,6 +70,14 @@ export interface NativeContext {
     event: 'session/event',
     callback: (session: { id: string }, event: NativeEvent) => void,
   ): () => void;
+  on(
+    event: 'agent/error',
+    callback: (input: { agent: NativeAgent; turn?: number; step?: number; error: unknown }) => void,
+  ): () => void;
+  on(
+    event: 'goal/changed' | 'goal/activation-changed',
+    callback: (input: { agent: NativeAgent; change?: unknown }) => void,
+  ): () => void;
   logger?: {
     info(message: string): void;
     warn(message: string): void;
@@ -76,7 +89,21 @@ export interface NativeContext {
     restrict(filter: { allow: string[] }): () => void;
     definitions(scope?: NativeAgent): ToolDefinition[];
   };
-  workingDirectory: { ensure(agent: NativeAgent, signal?: AbortSignal): Promise<string> };
+  workingDirectory: {
+    get(session: NativeAgent['session']): string;
+    set(agent: NativeAgent, cwd: string, signal?: AbortSignal): Promise<string>;
+    ensure(agent: NativeAgent, signal?: AbortSignal): Promise<string>;
+  };
+  goals?: {
+    get(agent: NativeAgent): NativeGoalView | undefined;
+    create(
+      agent: NativeAgent,
+      input: { objective: string; maxGoalRounds?: number },
+    ): NativeGoalView;
+    pause(agent: NativeAgent, ref: { id: string; revision: number }): NativeGoalView;
+    resume(agent: NativeAgent, ref: { id: string; revision: number }): NativeGoalView;
+    clear(agent: NativeAgent, ref: { id: string; revision: number }): unknown;
+  };
   sessions: { flush(session: NativeAgent['session']): Promise<boolean> };
   agentPresets?: {
     register(definition: {

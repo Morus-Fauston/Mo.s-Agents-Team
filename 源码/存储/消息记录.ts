@@ -63,7 +63,9 @@ export class MessageCatalog {
     if (candidates.length === 1) return candidates[0]!;
     throw new ProjectError('TARGET_NOT_FOUND', '当前项目没有此会话入口，不猜测目标');
   }
-  private participant(actor: ChatActor): ChatMessage['sender'] {
+  private participant(actor: ChatActor | { kind: 'system' }): ChatMessage['sender'] {
+    if (actor.kind === 'system')
+      return { kind: 'system', sessionId: null, roleId: null, roleCode: 'MAT' };
     if (actor.kind === 'user')
       return { kind: 'user', sessionId: null, roleId: null, roleCode: null };
     const session = this.sessions.get(actor.sessionId);
@@ -94,10 +96,28 @@ export class MessageCatalog {
   save(actor: ChatActor, raw: ChatInput): SavedMessage {
     return this.saveInternal(actor, raw, false);
   }
+  saveSystem(raw: ChatInput): SavedMessage {
+    const input = chatInputSchema.parse(raw);
+    if (
+      input.target === 'user' ||
+      input.replyTo ||
+      input.references.length ||
+      this.resolveTarget(input.target).roleType !== 'supervisor'
+    )
+      throw new ProjectError(
+        'INVALID_SYSTEM_NOTIFICATION',
+        '平台通知只投递明确主管入口，不冒充用户或携带引用授权',
+      );
+    return this.saveInternal({ kind: 'system' }, input, false);
+  }
   recordOutput(actor: Extract<ChatActor, { kind: 'session' }>, raw: ChatInput): SavedMessage {
     return this.saveInternal(actor, raw, true);
   }
-  private saveInternal(actor: ChatActor, raw: ChatInput, output: boolean): SavedMessage {
+  private saveInternal(
+    actor: ChatActor | { kind: 'system' },
+    raw: ChatInput,
+    output: boolean,
+  ): SavedMessage {
     const input = chatInputSchema.parse(raw);
     return transaction(this.db, () => {
       const sender = this.participant(actor);
@@ -106,7 +126,7 @@ export class MessageCatalog {
           ? { kind: 'user' as const }
           : { kind: 'session' as const, sessionId: this.resolveTarget(input.target).id };
       const recipient = this.participant(target);
-      const senderKey = sender.sessionId ?? 'user',
+      const senderKey = sender.kind === 'system' ? 'mat-platform' : (sender.sessionId ?? 'user'),
         recipientKey = recipient.sessionId ?? 'user';
       if (senderKey === recipientKey)
         throw new ProjectError('INVALID_TARGET', '私聊需要另一个明确联系入口');

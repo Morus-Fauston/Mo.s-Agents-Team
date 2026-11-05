@@ -95,7 +95,11 @@ function Message({
     <article className={styles.chatMessage} data-message-id={message.id}>
       <header>
         <strong>
-          {message.sender.kind === 'user' ? '用户' : (session?.name ?? message.sender.roleCode)}
+          {message.sender.kind === 'user'
+            ? '用户'
+            : message.sender.kind === 'system'
+              ? 'MAT平台'
+              : (session?.name ?? message.sender.roleCode)}
         </strong>
         {session && <span>{session.addresses.readable}</span>}
         <time dateTime={message.savedAt}>{new Date(message.savedAt).toLocaleString()}</time>
@@ -496,7 +500,7 @@ export function ChatPanel({ project }: { project: ProjectView }) {
                     .map(
                       (id) =>
                         sessions.data?.find((session) => session.id === id)?.addresses.readable ??
-                        id,
+                        (id === 'mat-platform' ? 'MAT平台' : id),
                     )
                     .join(' ↔ ')}
                 </button>

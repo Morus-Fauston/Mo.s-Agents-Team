@@ -1,5 +1,7 @@
 import type { ContextSource } from '../业务/上下文.ts';
 export interface RequestRecord {
+  executionId?: string | null;
+  executionContextVersion?: string | null;
   id: string;
   sessionId: string;
   nativeAttemptId: string;

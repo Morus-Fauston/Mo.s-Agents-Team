@@ -42,6 +42,13 @@ export class CommunicationService {
       await this.enqueue(projectId, saved.receipt.targetSessionId, id);
     return catalog.get(id);
   }
+  async sendSystem(projectId: string, input: ChatInput): Promise<SavedMessage> {
+    if (this.closed) throw new ProjectError('COMMUNICATION_CLOSED', '通信服务正在关闭');
+    const catalog = this.projects.forProject(projectId).messages(),
+      saved = catalog.saveSystem(input);
+    await this.enqueue(projectId, saved.receipt.targetSessionId!, saved.message.id);
+    return catalog.get(saved.message.id);
+  }
   private enqueue(projectId: string, sessionId: string, reconcileId?: string): Promise<void> {
     const key = `${projectId}:${sessionId}`;
     const previous = this.queues.get(key) ?? Promise.resolve();
@@ -275,7 +282,7 @@ export class CommunicationService {
         id: messageIdentity('native-output:' + agent.id + ':' + message.id),
         target: origin.sender.sessionId ?? 'user',
         content,
-        replyTo: origin.id,
+        ...(origin.sender.kind === 'system' ? {} : { replyTo: origin.id }),
       },
     );
     if (saved.receipt.targetSessionId !== null)

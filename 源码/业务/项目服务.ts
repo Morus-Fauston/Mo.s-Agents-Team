@@ -20,12 +20,32 @@ export class ProjectService {
       throw new ProjectError('INVALID_REGISTRY', '插件项目目录登记损坏，请核对原文件');
     this.roots = [...new Set(saved as string[])];
     for (const root of this.roots) {
+      let connection: ProjectConnection | undefined;
       try {
-        this.connections.set(root, connectProject(root));
+        connection = connectProject(root);
+        this.requireUniqueIdentity(connection.snapshot());
+        this.connections.set(root, connection);
       } catch (error) {
+        connection?.close();
         this.failures.set(root, String(error));
       }
     }
+  }
+  private requireUniqueIdentity(project: ProjectView): void {
+    for (const connection of this.connections.values()) {
+      const existing = connection.snapshot();
+      if (existing.id === project.id && existing.root !== project.root)
+        throw new ProjectError(
+          'PROJECT_ID_ALREADY_ATTACHED',
+          '同一项目身份已经绑定另一个宿主根，请核对迁移或工作树关联，不复制项目登记',
+        );
+    }
+  }
+  forProject(id: string): ProjectConnection {
+    this.requireOpen();
+    for (const connection of this.connections.values())
+      if (connection.snapshot().id === id) return connection;
+    throw new ProjectError('PROJECT_NOT_FOUND', '项目未接入当前插件');
   }
   private requireOpen(): void {
     if (this.closed) throw new ProjectError('SERVICE_CLOSED', '项目服务已经关闭');
@@ -46,6 +66,7 @@ export class ProjectService {
     if (existing) return existing.snapshot();
     const connection = connectProject(root);
     try {
+      this.requireUniqueIdentity(connection.snapshot());
       const next = [...new Set([...this.roots, root])];
       const temporary = `${this.registry}.${randomUUID()}.tmp`;
       writeFileSync(temporary, JSON.stringify(next, null, 2), { flag: 'wx', encoding: 'utf8' });

@@ -4,11 +4,13 @@ import { randomUUID } from 'node:crypto';
 import { join, isAbsolute } from 'node:path';
 import { ProjectService } from '../业务/项目服务.ts';
 import { createApplication } from './应用.ts';
+import type { SessionRuntime } from '../宿主/会话装配.ts';
 export interface ConsoleConfiguration {
   stateDirectory: string;
   port: number;
   assetsDirectory?: string;
   onError?: (error: Error) => void;
+  createRuntime?: (service: ProjectService) => Promise<SessionRuntime>;
 }
 export interface ConsoleHandle {
   url: string;
@@ -29,8 +31,10 @@ export async function startConsole(config: ConsoleConfiguration): Promise<Consol
   if (!isAbsolute(config.stateDirectory)) throw new Error('插件存储必须是绝对目录');
   const service = new ProjectService(config.stateDirectory);
   let server: ReturnType<typeof serve> | undefined;
+  let runtime: SessionRuntime | undefined;
   try {
-    const app = createApplication(service, config.assetsDirectory);
+    runtime = await config.createRuntime?.(service);
+    const app = createApplication(service, config.assetsDirectory, runtime);
     server = serve({ fetch: app.fetch, hostname: '127.0.0.1', port: config.port });
     const activeServer = server;
     await new Promise<void>((resolve, reject) => {
@@ -52,7 +56,13 @@ export async function startConsole(config: ConsoleConfiguration): Promise<Consol
     return {
       url,
       close() {
-        closing ??= closeHTTP(activeServer).finally(() => service.close());
+        closing ??= closeHTTP(activeServer).finally(async () => {
+          try {
+            await runtime?.close();
+          } finally {
+            service.close();
+          }
+        });
         return closing;
       },
     };
@@ -60,7 +70,11 @@ export async function startConsole(config: ConsoleConfiguration): Promise<Consol
     try {
       if (server) await closeHTTP(server);
     } finally {
-      service.close();
+      try {
+        await runtime?.close();
+      } finally {
+        service.close();
+      }
     }
     throw error;
   }

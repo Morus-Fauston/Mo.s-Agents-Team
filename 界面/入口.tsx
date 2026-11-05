@@ -14,25 +14,9 @@ import { z } from 'zod';
 import { projectEntrySchema, projectSchema } from '../源码/契约/项目';
 import type { ProjectView } from '../源码/契约/项目';
 import styles from './工作台.module.css';
+import { request } from './请求';
+import { RoleAndSessionPanel } from './角色与会话';
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-async function request(path: string, body?: unknown): Promise<unknown> {
-  const response = await fetch(
-    path,
-    body === undefined
-      ? undefined
-      : {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(body),
-        },
-  );
-  const data: unknown = await response.json();
-  if (!response.ok) {
-    const error = z.object({ message: z.string() }).safeParse(data);
-    throw new Error(error.success ? error.data.message : '操作未成功，请稍后重试');
-  }
-  return data;
-}
 function useProjects() {
   return useQuery({
     queryKey: ['projects'],
@@ -149,28 +133,7 @@ function ProjectDetails({ project }: { project: ProjectView }) {
         <dt>共用规范</dt>
         <dd>{project.paths.team}</dd>
       </dl>
-      <h3>已登记角色</h3>
-      <div className={styles.roleList}>
-        {project.roles.map((role) => (
-          <article key={role.id} className={styles.role}>
-            <div>
-              <strong>{role.type === 'supervisor' ? '项目主管' : role.code}</strong>
-              <span>
-                {role.code} · {role.id}
-              </span>
-            </div>
-            <p>
-              {role.configuration.provider} / {role.configuration.model}
-            </p>
-            <dl className={styles.facts}>
-              <dt>身份资料</dt>
-              <dd>{role.paths.soul}</dd>
-              <dt>工作准则</dt>
-              <dd>{role.paths.agent}</dd>
-            </dl>
-          </article>
-        ))}
-      </div>
+      <RoleAndSessionPanel key={project.id} project={project} />
     </section>
   );
 }

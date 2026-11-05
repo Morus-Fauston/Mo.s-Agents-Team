@@ -12,20 +12,21 @@ import {
 import { join, isAbsolute } from 'node:path';
 import type { ExecutionConfiguration, InitializeInput, ProjectView } from '../契约/项目.ts';
 import { initializeSchema } from '../契约/项目.ts';
+import { ProjectError } from './错误.ts';
+import { transaction } from '../存储/事务.ts';
+import { RoleCatalog, migrateRoles } from '../存储/角色登记.ts';
+import { SessionCatalog, migrateSessions } from '../存储/会话记录.ts';
+import type { RoleInput, RegisteredRole, RoleUpdate } from '../契约/角色.ts';
+import type { SessionInput, SessionRecord } from '../契约/会话.ts';
+import type { RequestRecord } from '../契约/装配.ts';
+import { RequestCatalog } from '../存储/请求记录.ts';
+export { ProjectError } from './错误.ts';
 export type {
   ExecutionConfiguration,
   InitializeInput,
   RoleView,
   ProjectView,
 } from '../契约/项目.ts';
-export class ProjectError extends Error {
-  readonly code: string;
-  constructor(code: string, message: string) {
-    super(message);
-    this.code = code;
-    this.name = 'ProjectError';
-  }
-}
 function databaseError(error: unknown): unknown {
   if (error instanceof Error && 'errcode' in error && [5, 6].includes(Number(error.errcode)))
     return new ProjectError(
@@ -124,24 +125,15 @@ function view(db: DatabaseSync, root: string): ProjectView {
 }
 function migrate(db: DatabaseSync): void {
   const version = Number(db.prepare('PRAGMA user_version').get()?.user_version);
-  if (version > 1) throw new ProjectError('FUTURE_SCHEMA', '数据库版本高于当前软件，拒绝降级写入');
+  if (version > 3) throw new ProjectError('FUTURE_SCHEMA', '数据库版本高于当前软件，拒绝降级写入');
   if (version === 0) {
     db.exec(`CREATE TABLE project(singleton INTEGER PRIMARY KEY CHECK(singleton=1),id TEXT NOT NULL UNIQUE,name TEXT NOT NULL,attached INTEGER NOT NULL DEFAULT 0 CHECK(attached IN(0,1)),started INTEGER NOT NULL DEFAULT 0 CHECK(started IN(0,1)));
       CREATE TABLE role(id TEXT PRIMARY KEY,code TEXT NOT NULL UNIQUE,type TEXT NOT NULL,configuration TEXT NOT NULL);
       CREATE TABLE initialization(singleton INTEGER PRIMARY KEY CHECK(singleton=1),project_id TEXT NOT NULL,role_id TEXT NOT NULL,request TEXT NOT NULL);
       PRAGMA user_version=1;`);
   }
-}
-function transaction<T>(db: DatabaseSync, action: () => T): T {
-  db.exec('BEGIN IMMEDIATE');
-  try {
-    const result = action();
-    db.exec('COMMIT');
-    return result;
-  } catch (error) {
-    db.exec('ROLLBACK');
-    throw error;
-  }
+  if (version < 2) migrateRoles(db);
+  if (version < 3) migrateSessions(db);
 }
 export function initializeProject(input: InitializeInput): ProjectView {
   if (!input || typeof input.name !== 'string' || !input.name.trim() || input.name.length > 160)
@@ -240,6 +232,7 @@ export function initializeProject(input: InitializeInput): ProjectView {
         JSON.stringify(supervisor),
       );
       db.prepare('DELETE FROM initialization WHERE singleton=1').run();
+      db.prepare('INSERT INTO role_alias(alias,role_id) VALUES(?,?)').run('SUP', roleId);
       const snapshot = view(db, root);
       requireDocuments(snapshot);
       return snapshot;
@@ -262,7 +255,21 @@ export function readProject(inputRoot: string): ProjectView {
   }
 }
 export interface ProjectConnection {
+  skillSourceRoot(): string | null;
+  setSkillSourceRoot(root: string): void;
+  requests(sessionId: string): RequestRecord[];
+  saveRequest(record: RequestRecord): void;
   snapshot(): ProjectView;
+  roles(): RegisteredRole[];
+  registerRole(input: RoleInput): RegisteredRole;
+  updateRole(id: string, input: RoleUpdate): RegisteredRole;
+  reserveSession(input: SessionInput): SessionRecord;
+  sessions(): SessionRecord[];
+  session(id: string): SessionRecord;
+  bindSession(id: string, nativeSessionId: string): SessionRecord;
+  failSession(id: string, error: string): SessionRecord;
+  recordSessionError(id: string, error: string | null): void;
+  closeSession(id: string): void;
   close(): void;
 }
 export function connectProject(inputRoot: string): ProjectConnection {
@@ -276,11 +283,13 @@ export function connectProject(inputRoot: string): ProjectConnection {
   const db = new DatabaseSync(path);
   let closed = false;
   try {
+    db.exec('PRAGMA foreign_keys=ON');
     const version = Number(db.prepare('PRAGMA user_version').get()?.user_version);
-    if (version !== 1)
+    if (version < 1 || version > 3)
       throw new ProjectError('SCHEMA_MISMATCH', '项目数据库版本不匹配，请先核对升级与初始化结果');
     db.exec('PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE');
     try {
+      migrate(db);
       requireDocuments(view(db, root));
       db.prepare('UPDATE project SET attached=1 WHERE singleton=1').run();
       db.exec('COMMIT');
@@ -288,7 +297,76 @@ export function connectProject(inputRoot: string): ProjectConnection {
       db.exec('ROLLBACK');
       throw error;
     }
+    const roles = new RoleCatalog(db, root);
+    const sessions = new SessionCatalog(db, roles);
+    const requests = new RequestCatalog(db);
+    const requireOpen = () => {
+      if (closed) throw new ProjectError('CONNECTION_CLOSED', '项目连接已经关闭');
+    };
     return {
+      skillSourceRoot() {
+        requireOpen();
+        const row = db.prepare('SELECT skill_source_root FROM project WHERE singleton=1').get();
+        return row?.skill_source_root === null ? null : String(row?.skill_source_root);
+      },
+      setSkillSourceRoot(root) {
+        requireOpen();
+        if (!isAbsolute(root))
+          throw new ProjectError('INVALID_SKILL_ROOT', 'Skill来源必须为绝对目录');
+        db.prepare('UPDATE project SET skill_source_root=? WHERE singleton=1').run(
+          realpathSync(root),
+        );
+      },
+      requests(sessionId) {
+        requireOpen();
+        sessions.get(sessionId);
+        return requests.list(sessionId);
+      },
+      saveRequest(record) {
+        requireOpen();
+        sessions.get(record.sessionId);
+        requests.save(record);
+      },
+      roles() {
+        requireOpen();
+        return roles.list();
+      },
+      registerRole(input) {
+        requireOpen();
+        return roles.register(input);
+      },
+      updateRole(id, input) {
+        requireOpen();
+        return roles.update(id, input);
+      },
+      reserveSession(input) {
+        requireOpen();
+        return sessions.reserve(input);
+      },
+      sessions() {
+        requireOpen();
+        return sessions.list();
+      },
+      session(id) {
+        requireOpen();
+        return sessions.get(id);
+      },
+      bindSession(id, nativeSessionId) {
+        requireOpen();
+        return sessions.bind(id, nativeSessionId);
+      },
+      failSession(id, error) {
+        requireOpen();
+        return sessions.fail(id, error);
+      },
+      recordSessionError(id, error) {
+        requireOpen();
+        sessions.executionError(id, error);
+      },
+      closeSession(id) {
+        requireOpen();
+        sessions.close(id);
+      },
       snapshot() {
         if (closed) throw new ProjectError('CONNECTION_CLOSED', '项目连接已经关闭');
         return view(db, root);

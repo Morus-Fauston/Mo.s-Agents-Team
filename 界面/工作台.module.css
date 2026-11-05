@@ -16,6 +16,84 @@
 :global(input) {
   font: inherit;
 }
+:global(select),
+:global(textarea) {
+  font: inherit;
+}
+.form select,
+.form textarea {
+  width: 100%;
+  padding: 8px 10px;
+  background: #fff;
+  border: 1px solid #d2d7de;
+  border-radius: 6px;
+  color: #1b2230;
+}
+.form textarea {
+  min-height: 84px;
+  resize: vertical;
+}
+.settings {
+  border-top: 1px solid #e2e5ea;
+  border-bottom: 1px solid #e2e5ea;
+  padding: 16px 0;
+  margin-top: 24px;
+  font-size: 14px;
+}
+.settings summary,
+.request summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.path {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.65;
+}
+.sessionList {
+  display: grid;
+  gap: 12px;
+}
+.sessionRow {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  border-bottom: 1px solid #e2e5ea;
+  padding: 12px 0;
+  font-size: 14px;
+}
+.sessionRow p {
+  color: #5f6876;
+  margin: 8px 0;
+  overflow-wrap: anywhere;
+}
+.sessionRow button {
+  flex-shrink: 0;
+}
+.role .actions {
+  flex-wrap: wrap;
+}
+.configDialog {
+  position: fixed;
+  z-index: 20;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: min(820px, calc(100vw - 40px));
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+  padding: 28px;
+  background: #fff;
+  border: 1px solid #d2d7de;
+  border-radius: 10px;
+  box-shadow: 0 18px 60px #18233626;
+}
+.request {
+  padding: 14px 0;
+  border-top: 1px solid #e2e5ea;
+  font-size: 14px;
+}
 :global(button) {
   cursor: pointer;
 }

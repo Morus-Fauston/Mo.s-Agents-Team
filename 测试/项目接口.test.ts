@@ -59,3 +59,44 @@ test('非法输入和跨来源命令被拒绝，不产生项目登记', async ()
   expect(foreign.status).toBe(403);
   expect(service.list()).toEqual([]);
 });
+
+test('角色配置入口回读真实登记，脱离宿主不能创建替代会话', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'mat-role-api-'));
+  const project = join(root, '项目');
+  mkdirSync(project);
+  const service = new ProjectService(join(root, '插件'));
+  fixtures.push({ root, service });
+  const saved = service.create({
+    root: project,
+    name: '配置入口',
+    supervisor: { provider: 'p', model: 'm' },
+  });
+  const app = createApplication(service);
+  const path = `/api/projects/${saved.id}`;
+  const created = await app.request(path + '/roles', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      code: 'DEV',
+      name: '开发',
+      type: 'developer',
+      configuration: { provider: 'p', model: 'm' },
+    }),
+  });
+  expect(created.status).toBe(201);
+  const role = await created.json();
+  const changed = await app.request(path + `/roles/${role.id}`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ configuration: { provider: 'p', model: 'later' } }),
+  });
+  expect((await changed.json()).configuration.model).toBe('later');
+  const denied = await app.request(path + '/sessions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ roleId: role.id, name: '不会创建', purpose: '核对', cwd: project }),
+  });
+  expect(denied.status).toBe(409);
+  expect((await denied.json()).code).toBe('HOST_UNAVAILABLE');
+  expect(service.forProject(saved.id).sessions()).toEqual([]);
+});

@@ -11,6 +11,7 @@ import type { SessionRuntime } from '../宿主/会话装配.ts';
 import { streamSSE } from 'hono/streaming';
 import { chatInputSchema } from '../契约/私聊.ts';
 import { checkReferences, readReferenceText } from '../业务/引用文件.ts';
+import { createWorkbenchRoutes } from './工作台接口.ts';
 const attachment = z.object({ root: z.string().min(1) }).strict();
 export function createApplication(
   service: ProjectService,
@@ -38,6 +39,7 @@ export function createApplication(
       );
     return c.json({ code: 'OPERATION_FAILED', message: error.message }, 400);
   });
+  app.route('/api/projects', createWorkbenchRoutes(service));
   app.get('/api/projects', (c) => c.json(service.list()));
   app.post('/api/projects', async (c) => {
     const data = initializeSchema.parse(await c.req.json());

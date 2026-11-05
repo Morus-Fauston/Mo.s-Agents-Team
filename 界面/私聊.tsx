@@ -13,6 +13,7 @@ import type { ChatMessage, SavedMessage } from '../源码/契约/私聊';
 import type { ProjectView } from '../源码/契约/项目';
 import { request } from './请求';
 import styles from './工作台.module.css';
+import { useProjectUpdates } from './项目更新';
 const historySchema = z.object({
   conversation: conversationSchema,
   messages: z.array(savedMessageSchema),
@@ -32,43 +33,6 @@ const fresh = (): Draft => ({
   replyTo: null,
   attempted: false,
 });
-function useChatUpdates(projectId: string) {
-  const client = useQueryClient();
-  const [state, setState] = useState('正在连接更新…');
-  useEffect(() => {
-    let source: EventSource | undefined;
-    let cancelled = false;
-    const invalidate = () =>
-      client.invalidateQueries({ predicate: (query) => query.queryKey.includes(projectId) });
-    void request(`/api/projects/${projectId}/events/cursor`)
-      .then((value) => {
-        const { cursor } = z.object({ cursor: z.number() }).parse(value);
-        if (cancelled) return;
-        source = new EventSource(`/api/projects/${projectId}/events?after=${cursor}`);
-        source.onopen = () => {
-          if (!cancelled) setState('更新连接已建立');
-        };
-        source.onerror = () => {
-          if (!cancelled) setState('更新连接中断，正在按游标重连…');
-        };
-        source.addEventListener('change', () => {
-          void invalidate();
-        });
-        source.addEventListener('unavailable', () => {
-          if (!cancelled) setState('更新暂不可用，可手动刷新');
-        });
-        void invalidate();
-      })
-      .catch(() => {
-        if (!cancelled) setState('更新连接不可用，可手动刷新');
-      });
-    return () => {
-      cancelled = true;
-      source?.close();
-    };
-  }, [projectId, client]);
-  return state;
-}
 function Receipt({ saved }: { saved: SavedMessage }) {
   const receipt = saved.receipt;
   const title =
@@ -383,7 +347,7 @@ function Composer({
 export function ChatPanel({ project }: { project: ProjectView }) {
   const path = `/api/projects/${project.id}`,
     client = useQueryClient(),
-    updates = useChatUpdates(project.id);
+    updates = useProjectUpdates(project.id);
   const [category, setCategory] = useState<'user' | 'members'>('user');
   const [selected, setSelected] = useState<
     { kind: 'user'; sessionId: string } | { kind: 'members'; conversationId: string } | null

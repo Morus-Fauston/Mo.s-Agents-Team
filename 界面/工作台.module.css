@@ -707,3 +707,85 @@
     transform: none;
   }
 }
+.fieldset {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.phasePicker {
+  display: grid;
+  gap: 6px;
+  margin: 24px 0 16px;
+}
+.phasePicker select {
+  max-width: 100%;
+  padding: 9px 10px;
+  border: 1px solid #d2d7de;
+  border-radius: 4px;
+  background: white;
+}
+.checklistRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  padding: 14px 0;
+  border-bottom: 1px solid #e0e4e9;
+}
+.checklistRow > span {
+  flex: 1 1 280px;
+}
+.checklistRow small {
+  color: #56657c;
+}
+.ticketTable {
+  width: 100%;
+  margin: 16px 0;
+}
+.ticketTable th {
+  text-align: left;
+  white-space: nowrap;
+}
+.ticketTable td {
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+.ticketDetails {
+  margin-top: 28px;
+  padding-top: 24px;
+  border-top: 1px solid #d2d7de;
+  min-width: 0;
+}
+.recordRow {
+  padding: 20px 0;
+  border-bottom: 1px solid #e0e4e9;
+  overflow-wrap: anywhere;
+}
+.recordRow h4 {
+  margin: 0 0 10px;
+}
+.recordRow > p {
+  white-space: pre-wrap;
+}
+.recordRow small {
+  color: #56657c;
+  overflow-wrap: anywhere;
+}
+.materialPath {
+  overflow-wrap: anywhere;
+  font-family: Consolas, monospace;
+}
+.materialList {
+  padding-left: 20px;
+}
+.materialList li {
+  padding: 8px 0;
+  overflow-wrap: anywhere;
+}
+.materialList span,
+.materialList a {
+  margin-left: 16px;
+}

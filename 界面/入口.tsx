@@ -17,6 +17,9 @@ import styles from './工作台.module.css';
 import { request } from './请求';
 import { RoleAndSessionPanel } from './角色与会话';
 const ChatPanel = lazy(() => import('./私聊').then((module) => ({ default: module.ChatPanel })));
+const TicketWorkbench = lazy(() =>
+  import('./票据工作台').then((module) => ({ default: module.TicketWorkbench })),
+);
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 function useProjects() {
   return useQuery({
@@ -120,7 +123,7 @@ function CreateDialog({ mode }: { mode: 'create' | 'attach' }) {
   );
 }
 function ProjectDetails({ project }: { project: ProjectView }) {
-  const [view, setView] = useState<'roles' | 'chat'>('roles');
+  const [view, setView] = useState<'roles' | 'chat' | 'workbench'>('roles');
   return (
     <section className={styles.details}>
       <div className={styles.sectionHeader}>
@@ -152,12 +155,24 @@ function ProjectDetails({ project }: { project: ProjectView }) {
         >
           私聊
         </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={view === 'workbench'}
+          onClick={() => setView('workbench')}
+        >
+          期次与票据
+        </button>
       </div>
       {view === 'roles' ? (
         <RoleAndSessionPanel key={project.id} project={project} />
-      ) : (
+      ) : view === 'chat' ? (
         <Suspense fallback={<p role="status">正在载入私聊…</p>}>
           <ChatPanel key={project.id} project={project} />
+        </Suspense>
+      ) : (
+        <Suspense fallback={<p role="status">正在载入工作台…</p>}>
+          <TicketWorkbench key={project.id} project={project} />
         </Suspense>
       )}
     </section>

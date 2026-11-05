@@ -12,6 +12,7 @@ import { ExplicitSkillGrants } from './本次Skill许可.ts';
 import { loadNativeModules } from './原生接口.ts';
 import { CommunicationService } from '../业务/私聊服务.ts';
 import { installCommunicationTools } from './私聊工具.ts';
+import { installWorkbenchTools } from './工作台工具.ts';
 import type {
   NativeAgent,
   NativeContext,
@@ -255,6 +256,10 @@ export class HostSessionRuntime implements SessionRuntime {
       },
       this.communication,
     );
+    installWorkbenchTools(agentCtx, agent, this.modules, role.type, (caller) => {
+      const binding = this.requireBinding(caller);
+      return { connection: binding.connection, sessionId: binding.session.id };
+    });
   }
   async open(projectId: string, sessionId: string): Promise<NativeAgent> {
     if (this.closed) throw new ProjectError('RUNTIME_CLOSED', '会话服务已经关闭');

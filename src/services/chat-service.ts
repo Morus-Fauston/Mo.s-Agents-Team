@@ -49,6 +49,24 @@ export class CommunicationService {
     await this.enqueue(projectId, saved.receipt.targetSessionId!, saved.message.id);
     return catalog.get(saved.message.id);
   }
+  async sendAcceptanceNotice(projectId: string, id: string): Promise<SavedMessage> {
+    if (this.closed) throw new ProjectError('COMMUNICATION_CLOSED', '通信服务正在关闭');
+    const catalog = this.projects.forProject(projectId).messages(),
+      saved = catalog.saveAcceptanceNotice(id);
+    await this.enqueue(projectId, saved.receipt.targetSessionId!, saved.message.id);
+    return catalog.get(saved.message.id);
+  }
+  async sendReviewResult(
+    projectId: string,
+    resultId: string,
+    messageId: string,
+  ): Promise<SavedMessage> {
+    if (this.closed) throw new ProjectError('COMMUNICATION_CLOSED', '通信服务正在关闭');
+    const catalog = this.projects.forProject(projectId).messages(),
+      saved = catalog.saveReviewResult(resultId, messageId);
+    await this.enqueue(projectId, saved.receipt.targetSessionId!, saved.message.id);
+    return catalog.get(saved.message.id);
+  }
   async sendControl(
     projectId: string,
     id: string,

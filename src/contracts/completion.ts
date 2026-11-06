@@ -59,6 +59,7 @@ export const reviewSchema = z.object({
   jobs: z.array(ownedJobSchema).default([]),
   control: actionProgressSchema.nullable().default(null),
   stopObservation: stoppedObservationSchema.nullable().default(null),
+  closure: actionProgressSchema.nullable().default(null),
   wait: z
     .object({
       state: z.enum(['registered', 'armed', 'signalled']),

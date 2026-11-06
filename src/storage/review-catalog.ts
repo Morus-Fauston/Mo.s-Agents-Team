@@ -245,6 +245,7 @@ export class ReviewCatalog {
         jobs: [],
         control: null,
         stopObservation: null,
+        closure: null,
         wait: { state: 'registered', resultId: null, at: now() },
         materialPath: null,
         workspaceCheck: null,
@@ -446,6 +447,12 @@ export class ReviewCatalog {
       }
       job.updatedAt = now();
       if (!previous) value.jobs.push(ownedJobSchema.parse(job));
+      if (value.closure)
+        value.closure = {
+          state: 'unknown',
+          note: '收尾后收到真实作业事实，重新核对，不复用旧停稳',
+          at: now(),
+        };
       if (value.control?.state === 'confirmed')
         value.control = {
           state: 'unknown',
@@ -481,6 +488,8 @@ export class ReviewCatalog {
           changed = true;
         }
       if (changed) {
+        if (value.closure)
+          value.closure = { state: 'unknown', note: '收尾后受管范围变化，重新核对', at: now() };
         if (value.control?.state === 'confirmed')
           value.control = {
             state: 'unknown',
@@ -515,6 +524,30 @@ export class ReviewCatalog {
       value.control = { state: quiet ? 'confirmed' : 'unknown', note, at: now() };
       if (!['decided', 'cancelled'].includes(value.status)) value.status = 'unknown';
       value.reason = note;
+      return this.save(value);
+    });
+  }
+  closeAfterResult(id: string, goalId: string, nativeSessionId: string): ReviewRecord {
+    return transaction(this.db, () => {
+      const value = this.get(id);
+      if (
+        value.status !== 'decided' ||
+        !value.wait.resultId ||
+        value.goalId !== goalId ||
+        value.nativeSessionId !== nativeSessionId ||
+        value.control?.state !== 'confirmed' ||
+        !value.stopObservation?.processesComplete
+      )
+        throw new ProjectError(
+          'REVIEW_CLOSURE_UNCONFIRMED',
+          '指定审核原Goal及自身范围尚未核清，不收尾',
+        );
+      value.closure = {
+        state: 'confirmed',
+        note: '本次独审已收尾，原Goal暂停并撤销续轮供历史回查；不伪造原生Goal完成',
+        at: now(),
+      };
+      if (value.sessionId) this.sessions.communicationState(value.sessionId, 'paused');
       return this.save(value);
     });
   }
@@ -718,6 +751,27 @@ export class ReviewCatalog {
     });
   }
   /** Internal bridge for a formally stored review result; not a model approval or resume tool. */
+  decided(id: string, resultId: string): ReviewRecord {
+    return transaction(this.db, () => {
+      const value = this.get(id),
+        result = this.db.prepare('SELECT data FROM review_result WHERE id=?').get(resultId);
+      if (!result || value.wait.resultId !== resultId)
+        throw new ProjectError('REVIEW_RESULT_UNCONFIRMED', '没有同次保存并触达等待的正式意见');
+      const stored = JSON.parse(String(result.data)) as {
+        reviewId: string;
+        versionId: string;
+        author: { sessionId: string };
+      };
+      if (
+        stored.reviewId !== value.id ||
+        stored.versionId !== value.versionId ||
+        stored.author.sessionId !== value.sessionId
+      )
+        throw new ProjectError('REVIEW_RESULT_SOURCE', '正式意见未关联本次独审及版本');
+      value.status = 'decided';
+      return this.save(value);
+    });
+  }
   signalWait(
     id: string,
     reviewerSessionId: string,

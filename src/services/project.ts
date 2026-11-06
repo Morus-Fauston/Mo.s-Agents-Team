@@ -26,6 +26,8 @@ import { ExecutionCatalog, migrateExecutions } from '../storage/execution-catalo
 import { ControlCatalog, migrateControls } from '../storage/control-catalog.ts';
 import { VersionCatalog, migrateVersions } from '../storage/version-catalog.ts';
 import { ReviewCatalog, migrateCompletions } from '../storage/review-catalog.ts';
+import { ReviewResultCatalog, migrateReviewResults } from '../storage/review-results-catalog.ts';
+import { AcceptanceCatalog, ensureAcceptanceSchema } from '../storage/acceptance-catalog.ts';
 export { ProjectError } from './errors.ts';
 export type {
   ExecutionConfiguration,
@@ -131,7 +133,7 @@ function view(db: DatabaseSync, root: string): ProjectView {
 }
 function migrate(db: DatabaseSync): void {
   const version = Number(db.prepare('PRAGMA user_version').get()?.user_version);
-  if (version > 9) throw new ProjectError('FUTURE_SCHEMA', '数据库版本高于当前软件，拒绝降级写入');
+  if (version > 10) throw new ProjectError('FUTURE_SCHEMA', '数据库版本高于当前软件，拒绝降级写入');
   if (version === 0) {
     db.exec(`CREATE TABLE project(singleton INTEGER PRIMARY KEY CHECK(singleton=1),id TEXT NOT NULL UNIQUE,name TEXT NOT NULL,attached INTEGER NOT NULL DEFAULT 0 CHECK(attached IN(0,1)),started INTEGER NOT NULL DEFAULT 0 CHECK(started IN(0,1)));
       CREATE TABLE role(id TEXT PRIMARY KEY,code TEXT NOT NULL UNIQUE,type TEXT NOT NULL,configuration TEXT NOT NULL);
@@ -146,6 +148,8 @@ function migrate(db: DatabaseSync): void {
   if (version < 7) migrateControls(db);
   if (version < 8) migrateVersions(db);
   if (version < 9) migrateCompletions(db);
+  if (version < 10) migrateReviewResults(db);
+  ensureAcceptanceSchema(db);
 }
 export function initializeProject(input: InitializeInput): ProjectView {
   if (!input || typeof input.name !== 'string' || !input.name.trim() || input.name.length > 160)
@@ -270,6 +274,8 @@ export interface ProjectConnection {
   controls(): ControlCatalog;
   versions(): VersionCatalog;
   reviews(): ReviewCatalog;
+  reviewResults(): ReviewResultCatalog;
+  acceptance(): AcceptanceCatalog;
   executions(): ExecutionCatalog;
   workbench(): WorkbenchCatalog;
   messages(): MessageCatalog;
@@ -304,7 +310,7 @@ export function connectProject(inputRoot: string): ProjectConnection {
   try {
     db.exec('PRAGMA foreign_keys=ON');
     const version = Number(db.prepare('PRAGMA user_version').get()?.user_version);
-    if (version < 1 || version > 9)
+    if (version < 1 || version > 10)
       throw new ProjectError('SCHEMA_MISMATCH', '项目数据库版本不匹配，请先核对升级与初始化结果');
     db.exec('PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE');
     try {
@@ -333,6 +339,23 @@ export function connectProject(inputRoot: string): ProjectConnection {
       versions,
       controls,
     );
+    const reviewResults = new ReviewResultCatalog(
+      db,
+      reviews,
+      executions,
+      workbench,
+      sessions,
+      controls,
+    );
+    const acceptance = new AcceptanceCatalog(
+      db,
+      workbench,
+      executions,
+      versions,
+      reviewResults,
+      reviews,
+      sessions,
+    );
     messages.bindControlledMessages(
       (id, session) => controls.resultMessage(id, session),
       (id, kind) => controls.controlMessage(id, kind),
@@ -344,6 +367,14 @@ export function connectProject(inputRoot: string): ProjectConnection {
       if (closed) throw new ProjectError('CONNECTION_CLOSED', '项目连接已经关闭');
     };
     return {
+      acceptance() {
+        requireOpen();
+        return acceptance;
+      },
+      reviewResults() {
+        requireOpen();
+        return reviewResults;
+      },
       reviews() {
         requireOpen();
         return reviews;

@@ -1,5 +1,6 @@
 import type { ContextSource } from '../services/context.ts';
 export interface RequestRecord {
+  reviewResultId?: string | null;
   executionId?: string | null;
   executionContextVersion?: string | null;
   reviewId?: string | null;

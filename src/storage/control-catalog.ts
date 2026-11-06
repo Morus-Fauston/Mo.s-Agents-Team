@@ -216,6 +216,16 @@ export class ControlCatalog {
           'EXECUTION_REVIEW_WAITING',
           '原执行正在等待正式独审，先办理原等待结果，不能普通恢复修改送审成果',
         );
+      if (input.action === 'resume' && execution.reviewResultId) {
+        const result = this.db
+          .prepare('SELECT data FROM review_result WHERE id=?')
+          .get(execution.reviewResultId);
+        if (!result || JSON.parse(String(result.data)).authorAction?.state !== 'confirmed')
+          throw new ProjectError(
+            'REVIEW_RESULT_PENDING',
+            '原正式结果的实际接续未核清，须接续原结果，不能普通恢复越过未知',
+          );
+      }
       const value: ControlRecord = {
         id: randomUUID(),
         operationId: input.operationId,
@@ -265,6 +275,90 @@ export class ControlCatalog {
       this.emit('control-changed', execution.id);
       return value;
     });
+  }
+  resumeReviewResultOnly(
+    actor: WorkbenchActor,
+    executionId: string,
+    resultId: string,
+    expectedRevision: number,
+    operationId: string,
+    reason: string,
+  ): void {
+    this.manager(actor);
+    this.requireDispatch();
+    const previous = this.activeControl(executionId),
+      execution = this.executions.get(executionId);
+    if (this.revision(executionId) !== expectedRevision)
+      throw new ProjectError('STALE_CONTROL', '控制修订已变化，请重新核对原结果及控制');
+    if (!previous) return;
+    if (previous.action === 'resume' && previous.status === 'resumed') return;
+    if (
+      !['soft-stop', 'hard-stop'].includes(previous.action) ||
+      previous.status !== 'stopped' ||
+      execution.lifecycleState !== 'paused' ||
+      execution.writeOccupancy !== 'released' ||
+      execution.failure
+    )
+      throw new ProjectError(
+        'RESULT_RESUME_QUIESCENCE_REQUIRED',
+        '只可明确解除已核实停止的原结果限制，终止、未知或在途控制不能绕过',
+      );
+    const row = this.db.prepare('SELECT data FROM review_result WHERE id=?').get(resultId),
+      result = row
+        ? (JSON.parse(String(row.data)) as {
+            executionId: string;
+            reviewId: string;
+            progress: { state: string };
+          })
+        : undefined;
+    if (
+      !result ||
+      result.executionId !== execution.id ||
+      result.progress.state === 'confirmed' ||
+      !(execution.waitingReviewId === result.reviewId || execution.reviewResultId === resultId)
+    )
+      throw new ProjectError('RESULT_RESUME_SOURCE', '原结果或当前执行关联不符');
+    const value = controlSchema.parse({
+      ...previous,
+      id: randomUUID(),
+      operationId,
+      actor: this.wb.author(actor),
+      action: 'resume',
+      reason,
+      content: '仅接续原正式结果，不宣称原生Goal已恢复',
+      revision: expectedRevision + 1,
+      status: 'resumed',
+      goal: {
+        state: 'unnecessary',
+        note: '原Goal控制留给原结果协调；此记录只明确解除已停稳的上级限制',
+      },
+      cancel: null,
+      jobKills: [],
+      observation: previous.observation,
+      report: null,
+      messageId: randomUUID(),
+      resumeMessageId: randomUUID(),
+      resumeSnapshot: { mode: 'review-result-only', resultId, previousControlId: previous.id },
+      createdAt: now(),
+      updatedAt: now(),
+    });
+    this.db
+      .prepare(
+        'INSERT INTO execution_control(id,operation_id,request_hash,execution_id,revision,data) VALUES(?,?,?,?,?,?)',
+      )
+      .run(
+        value.id,
+        operationId,
+        createHash('sha256').update(JSON.stringify(value)).digest('hex'),
+        execution.id,
+        value.revision,
+        JSON.stringify(value),
+      );
+    execution.lifecycleState = 'waiting';
+    execution.waitingReviewId = result.reviewId;
+    execution.reviewResultId = null;
+    this.saveExecution(execution);
+    this.emit('control-changed', execution.id);
   }
   receipt(id: string, kind: 'goal' | 'cancel', raw: ControlReceipt): void {
     const receipt = receiptSchema.parse(raw);

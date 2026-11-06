@@ -1,9 +1,9 @@
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve, dirname, basename } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { ProjectService } from '../src/services/project-service.ts';
-function baseFixture() {
+function baseFixture(verification: 'automated' | 'manual' | 'review') {
   const directory = mkdtempSync(join(tmpdir(), 'mat-review-record-')),
     root = join(directory, '项目');
   mkdirSync(root);
@@ -49,7 +49,7 @@ function baseFixture() {
       included: '临时文件',
       excluded: '不运行模型',
       dependencies: [],
-      conditions: [{ condition: '有差异', verification: 'automated' }],
+      conditions: [{ condition: '有差异', verification }],
     }),
     role = connection.registerRole({
       code: 'DEV',
@@ -86,12 +86,17 @@ function baseFixture() {
     role,
     close() {
       projects.close();
+      if (
+        dirname(resolve(directory)) !== resolve(tmpdir()) ||
+        !basename(directory).startsWith('mat-review-record-')
+      )
+        throw new Error('拒绝清理非本夹具临时目录');
       rmSync(directory, { recursive: true, force: true });
     },
   };
 }
-export function completionFixture() {
-  const f = baseFixture(),
+export function completionFixture(verification: 'automated' | 'manual' | 'review' = 'automated') {
+  const f = baseFixture(verification),
     reviewer = f.connection.registerRole({
       code: 'AUD',
       name: '审阅',

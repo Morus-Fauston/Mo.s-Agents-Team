@@ -6,6 +6,13 @@ import { transaction } from './transaction.ts';
 import { ProjectError } from '../services/errors.ts';
 import { ensureMaterialSubdomain, materialDirectory } from '../services/ticket-materials.ts';
 import { materialDomainSchema } from '../contracts/workbench.ts';
+import {
+  acceptanceAssignmentSchema,
+  acceptanceRecordSchema,
+  ticketAcceptanceSchema,
+  supplementSchema,
+  escalationSchema,
+} from '../contracts/acceptance.ts';
 import type { MaterialDomain } from '../contracts/workbench.ts';
 import { SessionCatalog } from './session-catalog.ts';
 import { RoleCatalog } from './role-catalog.ts';
@@ -515,8 +522,11 @@ export class WorkbenchCatalog {
     actor: WorkbenchActor,
     ticket: TicketRecord,
     input: z.infer<typeof appendLogSchema>,
+    acceptanceGrant?: { author: RecordAuthor; executionId: string },
   ): LogRecord {
-    const { author, scope } = this.writer(actor, ticket.id);
+    const { author, scope } = acceptanceGrant
+      ? { author: acceptanceGrant.author, scope: { executionId: acceptanceGrant.executionId } }
+      : this.writer(actor, ticket.id);
     if (input.corrects) this.getLog(ticket.id, input.corrects);
     const n = Number(
       this.db
@@ -784,6 +794,308 @@ export class WorkbenchCatalog {
       versionId,
       reviewId,
       task.id,
+    ]);
+  }
+  supplementPrepared(actor: WorkbenchActor, id: string): void {
+    const author = this.author(actor),
+      record = parseRow(
+        this.db.prepare('SELECT data FROM execution_supplement WHERE id=?').get(id),
+        supplementSchema,
+        '补做安排',
+      ),
+      ticket = this.getTicket(record.ticketId);
+    if (
+      author.roleType !== 'supervisor' ||
+      author.sessionId !== record.author.sessionId ||
+      ticket.currentExecution !== record.previousExecutionId ||
+      !['review-passed', 'awaiting-acceptance', 'completed'].includes(ticket.state)
+    )
+      throw new ProjectError(
+        'SUPPLEMENT_SOURCE_INVALID',
+        '补做安排不是当前已收尾成果的实际主管决定',
+      );
+    ticket.state = 'todo';
+    ticket.currentExecution = null;
+    ticket.revision++;
+    for (const item of ticket.checklist)
+      Object.assign(item, {
+        checked: false,
+        result: '',
+        logId: null,
+        author: null,
+        updatedAt: null,
+      });
+    this.saveTicket(ticket);
+    this.revision(
+      'ticket',
+      ticket.id,
+      ticket,
+      author,
+      '已收尾成果退回补做；旧结果保留，登记关联新尝试',
+    );
+    this.revision('checklist', ticket.id, ticket.checklist, author, '新尝试重新取得对应版本结果');
+    const task = supervisorTaskSchema.parse({
+      id: record.id,
+      level: 'short',
+      title: ticket.code + ' · 补做跟进',
+      parentId: null,
+      state: 'unchecked',
+      basis: record.reason + '；旧执行 ' + record.previousExecutionId + '；意见 ' + record.resultId,
+      ticketIds: [ticket.id],
+      author,
+      createdAt: stamp(),
+      revision: 1,
+    });
+    this.db
+      .prepare('INSERT INTO supervisor_task(id,data) VALUES(?,?)')
+      .run(task.id, JSON.stringify(task));
+    this.revision('supervisor-task', task.id, task, author, '主管补做决定关联待处理');
+    this.history('supplement-requested', ticket.id, author, record.reason, [
+      record.id,
+      record.previousExecutionId,
+      record.resultId,
+      record.versionId,
+    ]);
+  }
+  reviewEscalated(actor: WorkbenchActor, id: string): void {
+    const author = this.author(actor),
+      record = parseRow(
+        this.db.prepare('SELECT data FROM review_escalation WHERE id=?').get(id),
+        escalationSchema,
+        '审阅争议',
+      );
+    if (actor.kind !== 'session' || record.author.sessionId !== author.sessionId)
+      throw new ProjectError('ESCALATION_SOURCE_INVALID', '不是已保存的实际争议来源');
+    const task = supervisorTaskSchema.parse({
+      id: record.taskId,
+      level: 'short',
+      title: this.getTicket(record.ticketId).code + ' · 明确升级 ' + record.kind,
+      parentId: null,
+      state: 'unchecked',
+      basis: record.basis + '；原正式意见 ' + record.resultId,
+      ticketIds: [record.ticketId],
+      author,
+      createdAt: stamp(),
+      revision: 1,
+    });
+    this.db
+      .prepare('INSERT INTO supervisor_task(id,data) VALUES(?,?)')
+      .run(task.id, JSON.stringify(task));
+    this.revision('supervisor-task', task.id, task, author, '原主执行显式争议升级');
+    this.history('review-escalated', record.ticketId, author, record.basis, [
+      record.id,
+      record.resultId,
+      record.taskId,
+    ]);
+  }
+  acceptanceAssigned(actor: WorkbenchActor, assignmentId: string): void {
+    const author = this.author(actor),
+      assignment = parseRow(
+        this.db.prepare('SELECT data FROM acceptance_assignment WHERE id=?').get(assignmentId),
+        acceptanceAssignmentSchema,
+        '指定验收',
+      );
+    const ticket = this.getTicket(assignment.ticketId);
+    if (
+      author.roleType !== 'supervisor' ||
+      author.sessionId !== assignment.requester.sessionId ||
+      !assignment.active ||
+      ticket.currentExecution !== assignment.executionId ||
+      !['review-passed', 'awaiting-acceptance'].includes(ticket.state)
+    )
+      throw new ProjectError('ACCEPTANCE_SOURCE_INVALID', '指定验收必须关联当前实际主管保存的安排');
+    ticket.state = 'awaiting-acceptance';
+    ticket.revision++;
+    this.saveTicket(ticket);
+    this.revision('ticket', ticket.id, ticket, author, '主管安排对应版本必要验收');
+    this.history('acceptance-assigned', ticket.id, author, assignment.reason, [
+      assignment.id,
+      assignment.versionId,
+      assignment.resultId,
+    ]);
+  }
+  acceptanceRecorded(
+    actor: WorkbenchActor,
+    assignmentId: string,
+    recordId: string,
+    checkCondition: boolean,
+  ): string | null {
+    if (
+      actor.kind === 'session' &&
+      this.sessions.get(actor.sessionId).communicationState !== 'active'
+    )
+      throw new ProjectError('ACCEPTANCE_OWNER_CONTROLLED', '暂停会话不能以验收接缝写入新结果');
+    const author = this.author(actor),
+      assignment = parseRow(
+        this.db.prepare('SELECT data FROM acceptance_assignment WHERE id=?').get(assignmentId),
+        acceptanceAssignmentSchema,
+        '指定验收',
+      ),
+      record = parseRow(
+        this.db.prepare('SELECT data FROM acceptance_result WHERE id=?').get(recordId),
+        acceptanceRecordSchema,
+        '验收结果',
+      );
+    const ticket = this.getTicket(assignment.ticketId);
+    const ownerMatches =
+      assignment.owner.kind === 'user'
+        ? actor.kind === 'user'
+        : actor.kind === 'session' && actor.sessionId === assignment.owner.sessionId;
+    if (
+      !assignment.active ||
+      !ownerMatches ||
+      record.assignmentId !== assignment.id ||
+      record.author.kind !== author.kind ||
+      record.author.sessionId !== author.sessionId ||
+      record.checkCondition !== checkCondition ||
+      record.versionId !== assignment.versionId ||
+      ticket.currentExecution !== assignment.executionId ||
+      ticket.state !== 'awaiting-acceptance'
+    )
+      throw new ProjectError(
+        'ACCEPTANCE_SOURCE_INVALID',
+        '验收结果不是当前指定实际责任方的版本记录',
+      );
+    let logId: string | null = null;
+    if (checkCondition && assignment.conditionId) {
+      const item = ticket.checklist.find((item) => item.id === assignment.conditionId);
+      if (
+        !item ||
+        item.revision !== assignment.conditionRevision ||
+        (item.verification === 'manual' && actor.kind !== 'user')
+      )
+        throw new ProjectError('ACCEPTANCE_CONDITION_CHANGED', '人工来源或指定条件已变化');
+      // This grant only writes this assigned condition and its same-transaction verification Log.
+      const log = this.appendLogInside(
+        actor,
+        ticket,
+        {
+          operationId: record.id,
+          title: '指定验收 · ' + item.id,
+          content: record.basis,
+          type: 'verification',
+          importance: 'normal',
+          references: [assignment.id, assignment.versionId, record.id, ...record.evidencePaths],
+        },
+        { author, executionId: assignment.executionId },
+      );
+      logId = log.id;
+      Object.assign(item, {
+        checked: record.decision === 'accept',
+        result: record.basis,
+        logId,
+        author,
+        updatedAt: stamp(),
+      });
+      this.saveTicket(ticket);
+      this.revision('checklist', ticket.id, ticket.checklist, author, '指定验收结果关联同次Log');
+    }
+    this.history('acceptance-recorded', ticket.id, author, record.basis, [
+      assignment.id,
+      record.id,
+      assignment.versionId,
+      ...(logId ? [ticket.id + ':' + logId] : []),
+    ]);
+    return logId;
+  }
+  acceptanceConfirmed(actor: WorkbenchActor, acceptanceId: string): void {
+    const author = this.author(actor),
+      accepted = parseRow(
+        this.db.prepare('SELECT data FROM ticket_acceptance WHERE id=?').get(acceptanceId),
+        ticketAcceptanceSchema,
+        '主管接受',
+      ),
+      ticket = this.getTicket(accepted.ticketId);
+    if (
+      author.roleType !== 'supervisor' ||
+      author.sessionId !== accepted.author.sessionId ||
+      ticket.currentExecution !== accepted.executionId ||
+      !['review-passed', 'awaiting-acceptance'].includes(ticket.state)
+    )
+      throw new ProjectError('ACCEPTANCE_SOURCE_INVALID', '结票必须关联当前实际主管的完整核对记录');
+    ticket.state = 'completed';
+    ticket.revision++;
+    this.saveTicket(ticket);
+    this.revision('ticket', ticket.id, ticket, author, '主管核对对应版本并明确接受');
+    for (const row of this.db
+      .prepare(
+        "SELECT json_extract(data,'$.taskId') AS task_id FROM completion WHERE execution_id=? UNION SELECT id AS task_id FROM execution_supplement WHERE json_extract(data,'$.executionId')=?",
+      )
+      .all(accepted.executionId, accepted.executionId)) {
+      const task = this.getTask(String(row.task_id));
+      if (task.state !== 'checked') {
+        task.state = 'checked';
+        task.basis = accepted.basis + '；接受记录 ' + accepted.id;
+        task.revision++;
+        this.db
+          .prepare('UPDATE supervisor_task SET data=? WHERE id=?')
+          .run(JSON.stringify(task), task.id);
+        this.revision('supervisor-task', task.id, task, author, '主管接受业务办结关联待处理');
+      }
+    }
+    this.history('ticket-accepted', ticket.id, author, accepted.basis, [
+      accepted.id,
+      accepted.versionId,
+      accepted.resultId,
+      ...accepted.assignmentResultIds,
+    ]);
+  }
+  reviewDecided(
+    actor: WorkbenchActor,
+    ticketId: string,
+    input: {
+      resultId: string;
+      reviewId: string;
+      executionId: string;
+      versionId: string;
+      verdict: 'pass' | 'return';
+      basis: string;
+    },
+  ): void {
+    const author = this.author(actor),
+      scope = actor.kind === 'session' ? this.scope?.(actor.sessionId) : undefined;
+    if (
+      author.roleType !== 'reviewer' ||
+      scope?.kind !== 'review' ||
+      scope.reviewId !== input.reviewId ||
+      scope.executionId !== input.executionId ||
+      scope.ticketId !== ticketId
+    )
+      throw new ProjectError('REVIEW_RESULT_SOURCE', '正式转态不是本次实际独审职责');
+    const row = this.db.prepare('SELECT data FROM review_result WHERE id=?').get(input.resultId);
+    if (!row)
+      throw new ProjectError('REVIEW_RESULT_REQUIRED', '正式转态必须关联已保存的不可变审计意见');
+    const result = JSON.parse(String(row.data)) as {
+      reviewId: string;
+      versionId: string;
+      verdict: string;
+      author: { sessionId: string };
+    };
+    if (
+      result.reviewId !== input.reviewId ||
+      result.versionId !== input.versionId ||
+      result.verdict !== input.verdict ||
+      result.author.sessionId !== author.sessionId
+    )
+      throw new ProjectError('REVIEW_RESULT_SOURCE', '审计来源或版本不符，未修改票据');
+    const ticket = this.getTicket(ticketId);
+    if (ticket.state !== 'awaiting-review' || ticket.currentExecution !== input.executionId)
+      throw new ProjectError('REVIEW_TRANSITION_INVALID', '原交付不再处于当前待审阅');
+    ticket.state = input.verdict === 'pass' ? 'review-passed' : 'in-progress';
+    ticket.revision++;
+    this.saveTicket(ticket);
+    this.revision(
+      'ticket',
+      ticket.id,
+      ticket,
+      author,
+      input.verdict === 'pass' ? '正式独审通过，不自动结票' : '正式退回原执行同次修正',
+    );
+    this.history('review-' + input.verdict, ticket.id, author, input.basis, [
+      input.executionId,
+      input.versionId,
+      input.reviewId,
+      input.resultId,
     ]);
   }
   createTask(actor: WorkbenchActor, raw: unknown): SupervisorTask {

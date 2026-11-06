@@ -15,6 +15,7 @@ import { createWorkbenchRoutes } from './workbench-routes.ts';
 import { controlInputSchema } from '../contracts/controls.ts';
 import { createVersionRoutes } from './version-routes.ts';
 import { createReviewRoutes } from './review-routes.ts';
+import { createAcceptanceRoutes } from './acceptance-routes.ts';
 const attachment = z.object({ root: z.string().min(1) }).strict();
 export function createApplication(
   service: ProjectService,
@@ -45,6 +46,7 @@ export function createApplication(
   app.route('/api/projects', createWorkbenchRoutes(service));
   app.route('/api/projects', createVersionRoutes(service));
   app.route('/api/projects', createReviewRoutes(service, runtime));
+  app.route('/api/projects', createAcceptanceRoutes(service, runtime));
   app.get('/api/projects/:project/control', (c) => {
     const id = c.req.param('project');
     return c.json(

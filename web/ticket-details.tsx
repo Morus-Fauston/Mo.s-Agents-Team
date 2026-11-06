@@ -17,6 +17,7 @@ import { WorkbenchForm, text, lines, VerificationSelect } from './workbench-form
 import type { WorkbenchCommand } from './workbench-form';
 import { request } from './request';
 import { ExecutionObservation } from './execution-observation';
+import { TicketAcceptance } from './ticket-acceptance';
 import styles from './workbench.module.css';
 function Markdown({ content }: { content: string }) {
   return (
@@ -722,7 +723,7 @@ export function TicketDetails({
   run: WorkbenchCommand;
 }) {
   const [view, setView] = useState<
-      'requirements' | 'checklist' | 'logs' | 'materials' | 'revisions' | 'execution'
+      'requirements' | 'checklist' | 'logs' | 'materials' | 'revisions' | 'execution' | 'acceptance'
     >('requirements'),
     base = `/api/projects/${projectId}`,
     path = base + `/tickets/${ticketId}`;
@@ -757,6 +758,7 @@ export function TicketDetails({
             ['logs', 'Log'],
             ['materials', '材料'],
             ['execution', '执行观察'],
+            ['acceptance', '审阅与验收'],
             ['revisions', '修订历史'],
           ] as const
         ).map(([key, label]) => (
@@ -788,16 +790,14 @@ export function TicketDetails({
           </p>
           <div className={styles.actions}>
             <p>正式派工请通过 Chat 向主管提出；此处只读观察，不代替主管身份。</p>
-            <button type="button" className={styles.button} disabled>
-              独审（待接入）
-            </button>
-            <button type="button" className={styles.button} disabled>
-              结票（待接入）
+            <button type="button" className={styles.button} onClick={() => setView('acceptance')}>
+              查看审阅与验收
             </button>
           </div>
         </>
       )}
       {view === 'checklist' && <Checklist ticket={ticket} base={base} run={run} />}
+      {view === 'acceptance' && <TicketAcceptance projectId={projectId} ticketId={ticket.id} />}
       {view === 'logs' && <Logs path={path} projectId={projectId} run={run} />}
       {view === 'materials' && <Materials path={path} projectId={projectId} />}
       {view === 'execution' && (

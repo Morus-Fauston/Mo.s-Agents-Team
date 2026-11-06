@@ -285,11 +285,28 @@ export class CompletionService {
             executionId: review.executionId,
             versionId: version.id,
             ticket: version.ticket,
+            executionRequirements: connection.executions().get(review.executionId).requirements,
+            supplementalAttempt:
+              connection
+                .acceptance()
+                .supplements(review.ticketId)
+                .find((item) => item.executionId === review.executionId) ?? null,
             summary: version.summary,
             scope: version.scope,
             evidencePaths: version.evidencePaths,
             checklistItemIds: version.checklistItemIds,
             versions: connection.versions().headers(review.executionId),
+            previousReviewResults: connection
+              .reviewResults()
+              .list(review.executionId)
+              .map((result) => ({
+                id: result.id,
+                versionId: result.versionId,
+                verdict: result.verdict,
+                previousResultId: result.previousResultId,
+                fullOpinionLoaded: false,
+                readTool: 'mat_review_result',
+              })),
             currentWorkspace: check,
             sourceReadRoots: version.snapshot.roots.map((root) => root.root),
             materialWriteDomain: review.materialPath,
@@ -411,6 +428,22 @@ export class CompletionService {
         catalog = connection.reviews();
       for (const review of catalog.list()) {
         if (!review.sessionId || this.stops.has(review.id)) continue;
+        if (review.closure?.state === 'confirmed' && review.control?.state === 'confirmed') {
+          const agent = this.host.peek(project.id, review.sessionId);
+          try {
+            const goal = agent ? this.goals().get(agent) : undefined;
+            if (
+              agent?.id === review.nativeSessionId &&
+              agent.status === 'idle' &&
+              goal?.id === review.goalId &&
+              goal.activation === 'disarmed' &&
+              goal.phase !== 'active'
+            )
+              continue;
+          } catch {
+            /* Retain the ordinary original-identity stop reconciliation below. */
+          }
+        }
         let controlled =
           review.wait.state === 'signalled' ||
           ['cancelled', 'unknown', 'failed'].includes(review.status);
@@ -430,6 +463,21 @@ export class CompletionService {
       }
     }
     await Promise.allSettled([...this.stops.values()]);
+  }
+  async settleReview(project: string, id: string): Promise<void> {
+    if (this.closed) throw new ProjectError('COMPLETION_CLOSED', '审核控制正在关闭');
+    const review = this.catalog(project).get(id);
+    if (review.wait.state !== 'signalled' && review.status !== 'decided')
+      throw new ProjectError('REVIEW_RESULT_REQUIRED', '没有正式等待结果，不代替正常审核提前停止');
+    const previous = this.stops.get(id);
+    if (previous) return previous;
+    const job = this.stopReview(project, id);
+    this.stops.set(id, job);
+    try {
+      await job;
+    } finally {
+      if (this.stops.get(id) === job) this.stops.delete(id);
+    }
   }
   private async stopReview(project: string, id: string): Promise<void> {
     const connection = this.projects.forProject(project),
@@ -514,6 +562,12 @@ export class CompletionService {
         versionId: version.id,
         fingerprint: version.snapshot.fingerprint,
         ticket: version.ticket,
+        executionRequirements: connection.executions().get(review.executionId).requirements,
+        supplementalAttempt:
+          connection
+            .acceptance()
+            .supplements(review.ticketId)
+            .find((item) => item.executionId === review.executionId) ?? null,
         summary: version.summary,
         scope: version.scope,
         evidencePaths: version.evidencePaths,
@@ -521,6 +575,17 @@ export class CompletionService {
         currentWorkspace: check,
         materialWriteDomain: review.materialPath,
         sourceReadRoots: version.snapshot.roots.map((root) => root.root),
+        previousReviewResults: connection
+          .reviewResults()
+          .list(review.executionId)
+          .map((result) => ({
+            id: result.id,
+            versionId: result.versionId,
+            verdict: result.verdict,
+            previousResultId: result.previousResultId,
+            fullOpinionLoaded: false,
+            readTool: 'mat_review_result',
+          })),
       });
     if (Buffer.byteLength(text) > 65536)
       throw new ProjectError('REVIEW_CONTEXT_BUDGET', '完整审核输入超出预算，未截断后请求');

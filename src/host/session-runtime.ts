@@ -15,11 +15,15 @@ import { DispatchService } from '../services/dispatch-service.ts';
 import { ExecutionControlService } from '../services/execution-controls.ts';
 import { ProjectControlService } from '../services/project-controls.ts';
 import { CompletionService } from '../services/completion-service.ts';
+import { ReviewResultService } from '../services/review-result-service.ts';
+import { AcceptanceService } from '../services/acceptance-service.ts';
+import { installAcceptanceTools } from './acceptance-tools.ts';
 import { NativeProcessRanges } from './process-ranges.ts';
 import { installExecutionTools } from './execution-tools.ts';
 import { installCommunicationTools } from './chat-tools.ts';
 import { installWorkbenchTools } from './workbench-tools.ts';
 import { installReviewTools } from './review-tools.ts';
+import { installReviewResultTools } from './review-result-tools.ts';
 import type {
   NativeAgent,
   NativeContext,
@@ -57,7 +61,7 @@ interface Binding {
   loadedSkills: Map<string, { name: string; path: string; sha256: string }>;
   explicitSkills: ExplicitSkillGrants;
   currentRequest?: RequestRecord;
-  execution?: { executionId: string; version: string };
+  execution?: { executionId: string; version: string; reviewResultId: string | null };
   review?: { reviewId: string; versionId: string; version: string };
 }
 export interface SessionRuntime {
@@ -66,6 +70,8 @@ export interface SessionRuntime {
   readonly controls?: ExecutionControlService;
   readonly projectControl?: ProjectControlService;
   readonly completions?: CompletionService;
+  readonly reviewResults?: ReviewResultService;
+  readonly acceptance?: AcceptanceService;
   create(projectId: string, input: SessionInput): Promise<SessionRecord>;
   configuration(projectId: string, sessionId: string): unknown;
   close(): Promise<void>;
@@ -76,6 +82,8 @@ export class HostSessionRuntime implements SessionRuntime {
   readonly controls: ExecutionControlService;
   readonly projectControl: ProjectControlService;
   readonly completions: CompletionService;
+  readonly reviewResults: ReviewResultService;
+  readonly acceptance: AcceptanceService;
   private readonly ranges: NativeProcessRanges;
   private readonly ctx: NativeContext;
   private readonly projects: ProjectService;
@@ -148,6 +156,39 @@ export class HostSessionRuntime implements SessionRuntime {
       inspectReview: (project, id, review, agent) =>
         this.controls.inspectExecution(project, id, agent, review),
     });
+    this.reviewResults = new ReviewResultService(projects, this.communication, {
+      native: ctx,
+      epoch: this.dispatch.epoch,
+      peek: (project, session) => this.peek(project, session),
+      openControlled: (project, session) => this.openControlled(project, session),
+      settleReviewer: (project, id) => this.completions.settleReview(project, id),
+      inspectMain: (project, id, agent, afterClear) =>
+        this.controls.inspectExecution(project, id, agent, undefined, afterClear),
+      freshExecution: async (project, id, agent) => {
+        const connection = projects.forProject(project),
+          execution = connection.executions().currentForSession(id),
+          result = execution ? connection.reviewResults().list(execution.id).at(-1) : undefined;
+        if (!execution || !result)
+          throw new ProjectError('REVIEW_RETURN_CONTEXT_MISSING', '原执行正式意见不可取得');
+        const cwd = await ctx.workingDirectory.ensure(agent),
+          session = connection.session(id),
+          role = connection.roles().find((role) => role.id === session.roleId)!;
+        const context = assembleContext(connection.snapshot(), role, session, cwd),
+          input = this.dispatch.context(project, id, cwd, result.id);
+        if (!input)
+          throw new ProjectError('REVIEW_RETURN_CONTEXT_MISSING', '最新原票及规范无法装配');
+        return {
+          objective:
+            input.message.content[0]!.text +
+            '\n当前角色规范来源版本：' +
+            context.version +
+            '\n先用mat_review_result读全当前正式退回意见，只在原授权范围修正，再完成Chat。',
+          version: input.version + ':' + context.version,
+        };
+      },
+      assertWriteScope: (project, id, scopes) => this.controls.conflictGuard(project, id, scopes),
+    });
+    this.acceptance = new AcceptanceService(projects, this.communication, this.dispatch);
     this.projectControl = new ProjectControlService(
       projects,
       this.controls,
@@ -438,6 +479,28 @@ export class HostSessionRuntime implements SessionRuntime {
       },
       this.completions,
     );
+    installAcceptanceTools(
+      agentCtx,
+      agent,
+      this.modules,
+      role.type,
+      (caller) => {
+        const binding = this.requireBinding(caller);
+        return { connection: binding.connection, sessionId: binding.session.id };
+      },
+      this.acceptance,
+    );
+    installReviewResultTools(
+      agentCtx,
+      agent,
+      this.modules,
+      role.type,
+      (caller) => {
+        const binding = this.requireBinding(caller);
+        return { connection: binding.connection, sessionId: binding.session.id };
+      },
+      this.reviewResults,
+    );
     installExecutionTools(
       agentCtx,
       agent,
@@ -564,6 +627,14 @@ export class HostSessionRuntime implements SessionRuntime {
       !this.completions.admission(binding.connection.snapshot().id, binding.session.id, input.agent)
     )
       return { kind: 'reject', reason: '审核等待、控制或Goal身份尚未允许继续，普通输入不解除' };
+    if (
+      !this.reviewResults.admission(
+        binding.connection.snapshot().id,
+        binding.session.id,
+        input.agent,
+      )
+    )
+      return { kind: 'reject', reason: '正式返修结果尚未接纳实际原Goal，普通输入不能解除未知' };
     this.controls.assertModelGoal(
       binding.connection.snapshot().id,
       binding.session.id,
@@ -642,7 +713,11 @@ export class HostSessionRuntime implements SessionRuntime {
       cwd,
     );
     if (execution)
-      binding.execution = { executionId: execution.executionId, version: execution.version };
+      binding.execution = {
+        executionId: execution.executionId,
+        version: execution.version,
+        reviewResultId: execution.reviewResultId,
+      };
     else delete binding.execution;
     if (
       execution &&
@@ -659,7 +734,16 @@ export class HostSessionRuntime implements SessionRuntime {
     );
     if (
       !this.controls.admission(binding.connection.snapshot().id, binding.session.id) ||
-      !this.completions.admission(binding.connection.snapshot().id, binding.session.id, input.agent)
+      !this.completions.admission(
+        binding.connection.snapshot().id,
+        binding.session.id,
+        input.agent,
+      ) ||
+      !this.reviewResults.admission(
+        binding.connection.snapshot().id,
+        binding.session.id,
+        input.agent,
+      )
     )
       return { kind: 'reject', reason: '准备期间已进入等待或控制，不发起新的模型步骤' };
     const review = this.completions.context(binding.connection.snapshot().id, binding.session.id);
@@ -734,6 +818,7 @@ export class HostSessionRuntime implements SessionRuntime {
           ? {
               executionId: binding.execution.executionId,
               executionContextVersion: binding.execution.version,
+              reviewResultId: binding.execution.reviewResultId,
             }
           : {}),
       };
@@ -809,6 +894,8 @@ export class HostSessionRuntime implements SessionRuntime {
   async close() {
     if (this.closed) return;
     this.closed = true;
+    await this.acceptance.close();
+    await this.reviewResults.close();
     await this.completions.close();
     await this.projectControl.close();
     await this.controls.close();

@@ -87,6 +87,7 @@ export const executionSchema = z.object({
   ]),
   lifecycleState: z.enum(['active', 'waiting', 'paused', 'error', 'terminated', 'closed']),
   waitingReviewId: z.uuid().nullable().default(null),
+  reviewResultId: z.uuid().nullable().default(null),
   writeOccupancy: z.enum(['held', 'pending-release', 'released', 'unknown']),
   goalId: z.string().nullable(),
   goalObjective: z.string().nullable(),

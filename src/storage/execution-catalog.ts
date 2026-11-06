@@ -287,6 +287,7 @@ export class ExecutionCatalog {
         startupState: 'registered',
         lifecycleState: 'active',
         waitingReviewId: null,
+        reviewResultId: null,
         writeOccupancy: 'held',
         goalId: null,
         goalObjective: null,
@@ -445,7 +446,50 @@ export class ExecutionCatalog {
         throw new ProjectError('EXECUTION_CANNOT_WAIT', '原执行已受控或失败，不能改成等待');
       value.lifecycleState = 'waiting';
       value.waitingReviewId = reviewId;
+      value.reviewResultId = null;
       this.event(value, 'review-wait:' + reviewId, 'review-wait', { reviewId });
+    });
+  }
+  returnFromReview(id: string, reviewId: string, resultId: string, epoch: string): ExecutionRecord {
+    return transaction(this.db, () =>
+      this.change(id, (value) => {
+        if (
+          value.waitingReviewId === null &&
+          value.reviewResultId === resultId &&
+          value.lifecycleState === 'active'
+        )
+          return;
+        if (
+          value.waitingReviewId !== reviewId ||
+          value.lifecycleState !== 'waiting' ||
+          value.failure
+        )
+          throw new ProjectError('REVIEW_RETURN_CHANGED', '原执行已不在本次审阅等待');
+        value.waitingReviewId = null;
+        value.reviewResultId = resultId;
+        value.lifecycleState = 'active';
+        value.hostEpoch = epoch;
+        value.detachedAt = null;
+        value.writeOccupancy = 'held';
+        if (value.sessionId) this.sessions.communicationState(value.sessionId, 'active');
+        this.event(value, 'review-return:' + resultId, 'review-return', { reviewId, resultId });
+      }),
+    );
+  }
+  closeFromReview(id: string, reviewId: string, resultId: string): ExecutionRecord {
+    return transaction(this.db, () => {
+      const result = this.change(id, (value) => {
+        if (value.waitingReviewId !== reviewId || value.lifecycleState !== 'waiting')
+          throw new ProjectError('REVIEW_CLOSE_CHANGED', '原执行已不在本次通过等待');
+        value.waitingReviewId = null;
+        value.reviewResultId = resultId;
+        value.lifecycleState = 'closed';
+        value.writeOccupancy = 'released';
+        if (value.sessionId) this.sessions.communicationState(value.sessionId, 'paused');
+        this.event(value, 'review-close:' + resultId, 'review-close', { reviewId, resultId });
+      });
+      this.db.prepare('UPDATE execution SET current=0 WHERE id=?').run(id);
+      return result;
     });
   }
   private confirm(value: ExecutionRecord): void {

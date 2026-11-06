@@ -1,4 +1,5 @@
 import { randomUUID, createHash } from 'node:crypto';
+import { acceptanceNoticeSchema } from '../contracts/acceptance.ts';
 import type { DatabaseSync } from 'node:sqlite';
 import {
   chatInputSchema,
@@ -19,6 +20,7 @@ import { ProjectError } from '../services/errors.ts';
 import { transaction } from './transaction.ts';
 import { SessionCatalog } from './session-catalog.ts';
 import { RoleCatalog } from './role-catalog.ts';
+import { reviewResultSchema } from '../contracts/review-results.ts';
 export function migrateMessages(db: DatabaseSync): void {
   db.exec(`ALTER TABLE session ADD COLUMN communication_state TEXT NOT NULL DEFAULT 'active' CHECK(communication_state IN('active','paused','terminated','archived'));
  CREATE TABLE conversation(id TEXT PRIMARY KEY,party_a TEXT NOT NULL,party_b TEXT NOT NULL,opened_by_user INTEGER NOT NULL CHECK(opened_by_user IN(0,1)),UNIQUE(party_a,party_b));
@@ -138,6 +140,45 @@ export class MessageCatalog {
         '平台通知只投递明确主管入口，不冒充用户或携带引用授权',
       );
     return this.saveInternal({ kind: 'system' }, input, false);
+  }
+  saveAcceptanceNotice(id: string): SavedMessage {
+    const row = this.db.prepare('SELECT data FROM acceptance_notice WHERE id=?').get(id);
+    if (!row)
+      throw new ProjectError('ACCEPTANCE_NOTICE_NOT_FOUND', '没有事务保存的指定验收或争议通知');
+    const notice = acceptanceNoticeSchema.parse(JSON.parse(String(row.data)));
+    return this.saveInternal(
+      { kind: 'system' },
+      { id: notice.id, target: notice.targetSessionId, content: notice.content },
+      false,
+    );
+  }
+  saveReviewResult(resultId: string, messageId: string): SavedMessage {
+    const row = this.db.prepare('SELECT data FROM review_result WHERE id=?').get(resultId);
+    if (!row)
+      throw new ProjectError('REVIEW_RESULT_NOT_FOUND', '没有已保存的正式审计结果，不能投平台通知');
+    const result = reviewResultSchema.parse(JSON.parse(String(row.data))),
+      notice = result.notifications.find((notice) => notice.messageId === messageId);
+    if (!notice)
+      throw new ProjectError('REVIEW_RESULT_NOTICE_NOT_FOUND', '不是正式结果中保存的稳定通知身份');
+    const execution = this.db
+      .prepare('SELECT data FROM execution WHERE id=?')
+      .get(result.executionId);
+    if (!execution) throw new ProjectError('REVIEW_RESULT_SOURCE', '原执行缺件，未猜测通知对象');
+    const source = JSON.parse(String(execution.data)) as {
+      sessionId: string;
+      managerSessionIds: string[];
+    };
+    const expected = result.verdict === 'return' ? [source.sessionId] : source.managerSessionIds;
+    if (!expected.includes(notice.targetSessionId))
+      throw new ProjectError(
+        'REVIEW_RESULT_NOTICE_TARGET',
+        '正式意见通知对象不对应原作者或指定主管',
+      );
+    return this.saveInternal(
+      { kind: 'system' },
+      { id: notice.messageId, target: notice.targetSessionId, content: notice.content },
+      false,
+    );
   }
   recordOutput(actor: Extract<ChatActor, { kind: 'session' }>, raw: ChatInput): SavedMessage {
     return this.saveInternal(actor, raw, true);

@@ -72,12 +72,30 @@ export class DispatchService {
       result = catalog.register(actor, input, this.epoch, (scopes) =>
         this.globalGuard(projectId, scopes),
       );
-    if (result.isNew) {
-      const job = Promise.resolve().then(() => this.start(projectId, result.record.id));
-      this.jobs.set(result.record.id, job);
-      void job.finally(() => this.jobs.delete(result.record.id)).catch(() => {});
-    }
+    if (result.isNew) this.queueStart(projectId, result.record.id);
     return result.record;
+  }
+  supplement(projectId: string, actor: WorkbenchActor, raw: unknown) {
+    if (this.closed) throw new ProjectError('DISPATCH_CLOSED', '派工服务正在关闭');
+    const connection = this.projects.forProject(projectId);
+    connection.controls().requireDispatch();
+    let isNew = false;
+    const result = connection.acceptance().supplement(actor, raw, (input) => {
+      const registered = this.catalog(projectId).register(actor, input, this.epoch, (scopes) =>
+        this.globalGuard(projectId, scopes),
+      );
+      isNew = registered.isNew;
+      return registered.record;
+    });
+    if (isNew) this.queueStart(projectId, result.executionId);
+    return result;
+  }
+  private queueStart(projectId: string, id: string) {
+    if (!this.jobs.has(id)) {
+      const job = Promise.resolve().then(() => this.start(projectId, id));
+      this.jobs.set(id, job);
+      void job.finally(() => this.jobs.delete(id)).catch(() => {});
+    }
   }
   private async start(projectId: string, id: string): Promise<void> {
     const connection = this.projects.forProject(projectId),
@@ -362,15 +380,28 @@ export class DispatchService {
     projectId: string,
     sessionId: string,
     cwd: string,
-  ): { message: NativeMessage; version: string; executionId: string } | undefined {
+    returnResultId?: string,
+  ):
+    | {
+        message: NativeMessage;
+        version: string;
+        executionId: string;
+        reviewResultId: string | null;
+      }
+    | undefined {
     const catalog = this.catalog(projectId),
       value = catalog.currentForSession(sessionId);
     if (!value) return undefined;
+    const returning = returnResultId
+      ? this.projects.forProject(projectId).reviewResults().current(returnResultId)
+      : undefined;
+    if (returning && (returning.verdict !== 'return' || returning.executionId !== value.id))
+      throw new ProjectError('REVIEW_RETURN_CONTEXT_MISMATCH', '不是原执行对应的正式返修结果');
     if (
-      value.hostEpoch !== this.epoch ||
-      value.detachedAt ||
+      (!returning && value.hostEpoch !== this.epoch) ||
+      (!returning && value.detachedAt) ||
       !value.goalId ||
-      value.lifecycleState !== 'active' ||
+      (!returning && value.lifecycleState !== 'active') ||
       value.failure !== null
     )
       throw new ProjectError(
@@ -433,6 +464,18 @@ export class DispatchService {
             : null;
         })(),
         goalId: value.goalId,
+        formalReviewResults: connection
+          .reviewResults()
+          .list(value.id)
+          .map((result) => ({
+            id: result.id,
+            reviewId: result.reviewId,
+            versionId: result.versionId,
+            verdict: result.verdict,
+            previousResultId: result.previousResultId,
+            fullOpinionLoaded: false,
+            readTool: 'mat_review_result',
+          })),
         completionPolicy:
           '普通消息和idle不结票；按平台正式交回及后续审阅办理，当前不自行批准或假填人工项。',
       });
@@ -444,6 +487,7 @@ export class DispatchService {
     const version = createHash('sha256').update(body).digest('hex');
     return {
       executionId: value.id,
+      reviewResultId: value.reviewResultId,
       version,
       message: {
         id: messageIdentity('execution-context:' + value.id + ':' + version),
@@ -495,7 +539,7 @@ export class DispatchService {
         controls: connection.controls().list(record.id),
         jobs: connection.controls().jobs(record.id),
       },
-      unavailableActions: ['正式审阅意见和结票待10接入'],
+      unavailableActions: [],
       coordinationBasis: '当前插件可取得的声明写域；不是OS文件锁或外部作业停稳证明',
     };
   }

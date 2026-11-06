@@ -114,7 +114,8 @@ export function installExecutionTools(
       if (input.action === 'list') {
         const executionId =
           input.executionId ??
-          binding.connection.executions().currentForSession(binding.sessionId)?.id;
+          binding.connection.executions().currentForSession(binding.sessionId)?.id ??
+          binding.connection.reviews().forSession(binding.sessionId)?.executionId;
         if (!executionId)
           throw new ProjectError('VERSION_EXECUTION_REQUIRED', '请选择明确执行，未猜测他人版本');
         value = versions.headers(executionId);

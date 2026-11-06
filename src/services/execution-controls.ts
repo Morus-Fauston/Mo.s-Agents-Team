@@ -463,6 +463,7 @@ export class ExecutionControlService {
     executionId: string,
     agent: NativeAgent,
     reviewId?: string,
+    afterResultClear = false,
   ): Promise<StoppedObservation> {
     const connection = this.connection(project),
       catalog = connection.controls(),
@@ -486,11 +487,22 @@ export class ExecutionControlService {
       goalId = review?.goalId ?? execution.goalId;
     const ownedJobs = () =>
       reviewId ? connection.reviews().get(reviewId).jobs : catalog.jobs(execution.id);
+    const clearResult = afterResultClear
+      ? connection.reviewResults().list(execution.id).at(-1)
+      : undefined;
+    const allowedCleared =
+      afterResultClear &&
+      !review &&
+      clearResult?.verdict === 'pass' &&
+      clearResult.reviewId === execution.waitingReviewId &&
+      ['prepared', 'confirmed'].includes(clearResult.authorGoalClear?.state ?? '');
+    if (afterResultClear && !allowedCleared)
+      throw new ProjectError('REVIEW_CLEAR_INTENT_REQUIRED', '缺少本次通过结果的原Goal清除意图');
     const assertGoal = () => {
       const goal = this.goals().get(agent);
       if (
         agent.id !== nativeSessionId ||
-        (!(!review && !goal && execution.lifecycleState === 'terminated') &&
+        (!(!review && !goal && (execution.lifecycleState === 'terminated' || allowedCleared)) &&
           (goal?.id ?? null) !== goalId)
       )
         throw new ProjectError('GOAL_BINDING_MISMATCH', '停稳核对目标不是原Agent的原Goal');
@@ -537,7 +549,7 @@ export class ExecutionControlService {
     assertGoal();
     return observation;
   }
-  private conflictGuard(project: string, executionId: string, scopes: string[]): void {
+  conflictGuard(project: string, executionId: string, scopes: string[]): void {
     for (const entry of this.projects.list())
       if (!('unavailable' in entry))
         for (const other of this.connection(entry.id).executions().list())

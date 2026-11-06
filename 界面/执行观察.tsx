@@ -5,6 +5,7 @@ import { executionSchema, executionStepSchema, nativeGoalSchema } from '../源�
 import { request } from './请求';
 import styles from './工作台.module.css';
 import { ExecutionControls } from './控制入口';
+import { DeliveryDiff } from './交付差异';
 const detailSchema = z.object({
   record: executionSchema,
   steps: z.array(executionStepSchema),
@@ -53,6 +54,7 @@ function ExecutionRecordObservation({
   return (
     <section aria-label="执行观察">
       <ExecutionControls projectId={projectId} executionId={executionId} />
+      <DeliveryDiff projectId={projectId} executionId={executionId} />
       <h4>{stages[r.startupState]}</h4>
       <p>
         启动观察：已完成 {r.completedSteps} 个实际 Agent 步骤，持续启动要求至少 3

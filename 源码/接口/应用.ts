@@ -13,6 +13,7 @@ import { chatInputSchema } from '../契约/私聊.ts';
 import { checkReferences, readReferenceText } from '../业务/引用文件.ts';
 import { createWorkbenchRoutes } from './工作台接口.ts';
 import { controlInputSchema } from '../契约/控制.ts';
+import { createVersionRoutes } from './版本接口.ts';
 const attachment = z.object({ root: z.string().min(1) }).strict();
 export function createApplication(
   service: ProjectService,
@@ -41,6 +42,7 @@ export function createApplication(
     return c.json({ code: 'OPERATION_FAILED', message: error.message }, 400);
   });
   app.route('/api/projects', createWorkbenchRoutes(service));
+  app.route('/api/projects', createVersionRoutes(service));
   app.get('/api/projects/:project/control', (c) => {
     const id = c.req.param('project');
     return c.json(

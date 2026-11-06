@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -137,6 +137,28 @@ async function fixture() {
     },
   };
 }
+test('正式派工先固定实际工作区和材料基线，再创建原生Goal', async () => {
+  const f = await fixture();
+  try {
+    writeFileSync(join(f.root, '派工前.txt'), '必须进入派工基线');
+    const original = f.host.createGoal;
+    let beforeLaunch = '';
+    f.host.createGoal = (agent, input) => {
+      const record = f.connection.executions().list()[0]!,
+        baseline = f.connection.versions().list(record.id)[0];
+      if (baseline)
+        beforeLaunch = f.connection.versions().file(baseline.id, 0, '派工前.txt').toString();
+      return original(agent, input);
+    };
+    const record = f.service.dispatch(f.project.id, f.actor, f.input);
+    await expect.poll(() => f.connection.executions().get(record.id).goalDurableAt).not.toBeNull();
+    expect(beforeLaunch).toBe('必须进入派工基线');
+    expect(f.connection.versions().list(record.id)).toHaveLength(1);
+  } finally {
+    await f.close();
+  }
+});
+
 test('先返回稳定登记，异步Goal回执未知保留身份与占用，查询不另开会话', async () => {
   const f = await fixture();
   try {

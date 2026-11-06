@@ -272,6 +272,7 @@ export class ExecutionCatalog {
         cwd,
         cwdMode: input.cwd ? 'explicit' : 'preserve-current',
         writeScopes: scopes,
+        additionalRepositories: input.additionalRepositories,
         writeScopesDefaulted: input.writeScopes === undefined,
         requestedConfiguration: input.configuration ?? (session ? null : role.configuration),
         resolvedConfiguration: null,

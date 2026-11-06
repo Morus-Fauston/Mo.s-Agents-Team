@@ -93,6 +93,71 @@ export function installExecutionTools(
         );
       },
     );
+  register(
+    'mat_version',
+    '只读取得当前项目执行的固定版本、整票/返修差异、旧原件或审前工作区匹配。不会形成交付、启动模型或修改版本。按nextOffset完整续读JSON。',
+    z
+      .object({
+        action: z.enum(['list', 'detail', 'diff', 'check', 'file']),
+        executionId: z.uuid().optional(),
+        versionId: z.uuid().optional(),
+        mode: z.enum(['ticket', 'repair']).default('ticket'),
+        rootIndex: z.number().int().nonnegative().default(0),
+        path: z.string().min(1).optional(),
+        offset: z.number().int().nonnegative().default(0),
+      })
+      .strict(),
+    (input) => {
+      const binding = resolve(owner),
+        versions = binding.connection.versions();
+      let value: unknown;
+      if (input.action === 'list') {
+        const executionId =
+          input.executionId ??
+          binding.connection.executions().currentForSession(binding.sessionId)?.id;
+        if (!executionId)
+          throw new ProjectError('VERSION_EXECUTION_REQUIRED', '请选择明确执行，未猜测他人版本');
+        value = versions.headers(executionId);
+      } else {
+        if (!input.versionId) throw new ProjectError('VERSION_REQUIRED', '请选择固定版本ID');
+        const record = versions.get(input.versionId);
+        if (input.executionId && record.executionId !== input.executionId)
+          throw new ProjectError('VERSION_EXECUTION_MISMATCH', '固定版本不属于所选执行');
+        if (input.action === 'detail') value = record;
+        else if (input.action === 'check') value = versions.check(record.id);
+        else if (input.action === 'diff') value = versions.diff(record.id, input.mode);
+        else {
+          if (!input.path)
+            throw new ProjectError('VERSION_PATH_REQUIRED', '请选择版本内相对文件路径');
+          const bytes = versions.file(record.id, input.rootIndex, input.path);
+          let content: string, encoding: string;
+          try {
+            content = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+            encoding = 'utf8';
+          } catch {
+            content = bytes.toString('base64');
+            encoding = 'base64';
+          }
+          value = {
+            versionId: record.id,
+            path: input.path,
+            rootIndex: input.rootIndex,
+            byteLength: bytes.length,
+            encoding,
+            content,
+          };
+        }
+      }
+      const text = Array.from(JSON.stringify(value)),
+        end = Math.min(text.length, input.offset + 2000);
+      return {
+        content: text.slice(input.offset, end).join(''),
+        offset: input.offset,
+        nextOffset: end < text.length ? end : null,
+        totalCharacters: text.length,
+      };
+    },
+  );
   if (controls)
     register(
       'mat_control',

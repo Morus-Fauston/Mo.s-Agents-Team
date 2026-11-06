@@ -141,6 +141,7 @@ export class DispatchService {
       if (value.requestedConfiguration) agent.model.select(value.requestedConfiguration);
       const configuration = executionConfigurationSchema.parse(agent.model.current());
       const domain = connection.workbench().allocateCurrentMaterial(session.id);
+      const baseline = connection.versions().baseline(id);
       const ticket = connection.workbench().getTicket(value.ticketId);
       const objective = [
         'MAT本次正式执行。目标与权限仅限以下持久记录，不能从旧会话或Goal扩围。',
@@ -165,6 +166,16 @@ export class DispatchService {
           writeScopes: value.writeScopes,
           materialReadRoot: ticket.materialRoot,
           materialWriteDomain: domain.path,
+          dispatchBaseline: {
+            id: baseline.id,
+            fingerprint: baseline.snapshot.fingerprint,
+            roots: baseline.snapshot.roots.map((root) => ({
+              root: root.root,
+              kind: root.kind,
+              head: root.head,
+              tree: root.tree,
+            })),
+          },
           managers: value.managerSessionIds,
         }),
         '亲自执行本票。按需读取原票据及Log，不全量复述历史。完成和挂起使用平台正式交回；普通回复、原生Goal和idle不代表票据已完成。未经授权不提交或推送。',
@@ -484,7 +495,7 @@ export class DispatchService {
         controls: connection.controls().list(record.id),
         jobs: connection.controls().jobs(record.id),
       },
-      unavailableActions: ['交付版本待08接入', '完成交回和独审待09接入'],
+      unavailableActions: ['完成交回和独审待09接入'],
       coordinationBasis: '当前插件可取得的声明写域；不是OS文件锁或外部作业停稳证明',
     };
   }

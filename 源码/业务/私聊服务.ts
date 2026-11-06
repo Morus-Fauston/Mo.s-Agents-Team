@@ -49,6 +49,73 @@ export class CommunicationService {
     await this.enqueue(projectId, saved.receipt.targetSessionId!, saved.message.id);
     return catalog.get(saved.message.id);
   }
+  async sendControl(
+    projectId: string,
+    id: string,
+    kind: 'request' | 'resume',
+  ): Promise<SavedMessage> {
+    const catalog = this.projects.forProject(projectId).messages(),
+      saved = catalog.recordControl(id, kind);
+    await this.enqueue(projectId, saved.receipt.targetSessionId!, saved.message.id);
+    return catalog.get(saved.message.id);
+  }
+  async sendControlledResult(
+    projectId: string,
+    sessionId: string,
+    messageId: string,
+  ): Promise<SavedMessage> {
+    const catalog = this.projects.forProject(projectId).messages(),
+      saved = catalog.recordControlledResult(messageId, sessionId);
+    await this.enqueue(projectId, saved.receipt.targetSessionId!, saved.message.id);
+    return catalog.get(saved.message.id);
+  }
+  async prepareResume(projectId: string, sessionId: string, agent: NativeAgent): Promise<void> {
+    const key = `${projectId}:${sessionId}`,
+      previous = this.queues.get(key) ?? Promise.resolve(),
+      catalog = this.projects.forProject(projectId).messages();
+    const job = previous
+      .catch(() => {})
+      .then(async () => {
+        for (const pending of catalog.pending(sessionId)) {
+          const saved = catalog.beginDelivery(pending.message.id);
+          if (saved.receipt.state !== 'sending') continue;
+          const message = presentMessage(saved),
+            history = agent.session.deriveMessages().find((item) => item.id === message.id),
+            inbox = agent.inbox.nextStep.find((item) => item.id === message.id);
+          if (history || inbox) {
+            if (!matchesMessage((history ?? inbox)!, saved))
+              throw new ProjectError('NATIVE_MESSAGE_CONFLICT', '恢复输入身份或正文不一致，不重放');
+            if (history && saved.receipt.enteredAt === null)
+              throw new ProjectError(
+                'NATIVE_MESSAGE_UNCONFIRMED',
+                '原文已在历史但进入请求回执未核对，不重放未知输入',
+              );
+          } else {
+            if (saved.receipt.memoryAcceptedAt !== null)
+              throw new ProjectError(
+                'NATIVE_MESSAGE_UNCONFIRMED',
+                '原输入曾接纳却无法定位，恢复暂停核对',
+              );
+            agent.inject(message);
+          }
+          catalog.recordMemoryAccepted(message.id);
+        }
+        if (!(await this.host.flush(agent)))
+          throw new ProjectError('DURABILITY_UNCONFIRMED', '恢复前输入的持久接纳未确认');
+        for (const pending of catalog.pending(sessionId))
+          if (
+            pending.receipt.memoryAcceptedAt !== null &&
+            agent.inbox.nextStep.some((item) => item.id === pending.message.id)
+          )
+            catalog.recordDurableAccepted(pending.message.id);
+      });
+    this.queues.set(key, job);
+    try {
+      await job;
+    } finally {
+      if (this.queues.get(key) === job) this.queues.delete(key);
+    }
+  }
   private enqueue(projectId: string, sessionId: string, reconcileId?: string): Promise<void> {
     const key = `${projectId}:${sessionId}`;
     const previous = this.queues.get(key) ?? Promise.resolve();

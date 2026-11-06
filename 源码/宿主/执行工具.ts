@@ -7,6 +7,8 @@ import { messageIdentity } from '../业务/消息呈递.ts';
 import type { WorkflowType } from '../契约/角色.ts';
 import type { NativeAgent, NativeContext, NativeModules } from './原生接口.ts';
 import { nativeToolParameters } from './工具参数.ts';
+import { controlBodySchema } from '../契约/控制.ts';
+import type { ExecutionControlService } from '../业务/执行控制.ts';
 export function installExecutionTools(
   ctx: NativeContext,
   owner: NativeAgent,
@@ -14,6 +16,7 @@ export function installExecutionTools(
   role: WorkflowType,
   resolve: (agent: NativeAgent) => { connection: ProjectConnection; sessionId: string },
   service: DispatchService,
+  controls?: ExecutionControlService,
 ): void {
   type Exec = { agent: NativeAgent; callId: string };
   const register = <S extends z.ZodType>(
@@ -85,6 +88,34 @@ export function installExecutionTools(
             ...input,
             operationId: messageIdentity(
               'mat_dispatch:' + owner.id + ':' + event.seq + ':' + exec.callId,
+            ),
+          },
+        );
+      },
+    );
+  if (controls)
+    register(
+      'mat_control',
+      '明确控制一个执行。主管可控制本项目，普通执行只能停止自己；恢复先核对最新现场和修订。返回请求不等于工具或写入已停稳。',
+      controlBodySchema,
+      (input, exec) => {
+        const binding = resolve(owner),
+          event = owner.session
+            .snapshotEvents()
+            .findLast(
+              (event) =>
+                event.type === 'tool/call' &&
+                event.data.name === 'mat_control' &&
+                event.data.callId === exec.callId,
+            );
+        if (!event) throw new ProjectError('TOOL_CALL_ID_REQUIRED', '没有真实控制工具调用');
+        return controls.request(
+          binding.connection.snapshot().id,
+          { kind: 'session', sessionId: binding.sessionId },
+          {
+            ...input,
+            operationId: messageIdentity(
+              'mat_control:' + owner.id + ':' + event.seq + ':' + exec.callId,
             ),
           },
         );

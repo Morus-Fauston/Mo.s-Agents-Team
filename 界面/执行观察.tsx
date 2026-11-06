@@ -1,8 +1,10 @@
 import { useQuery } from '@tanstack/react-query';
+import { useState } from 'react';
 import { z } from 'zod';
 import { executionSchema, executionStepSchema, nativeGoalSchema } from '../源码/契约/执行';
 import { request } from './请求';
 import styles from './工作台.module.css';
+import { ExecutionControls } from './控制入口';
 const detailSchema = z.object({
   record: executionSchema,
   steps: z.array(executionStepSchema),
@@ -30,7 +32,7 @@ const stages = {
   error: '启动或执行异常',
   unknown: '结果未知，保留原执行核对',
 };
-export function ExecutionObservation({
+function ExecutionRecordObservation({
   projectId,
   executionId,
 }: {
@@ -50,6 +52,7 @@ export function ExecutionObservation({
     goal = native.goal ?? native.lastGoalSnapshot;
   return (
     <section aria-label="执行观察">
+      <ExecutionControls projectId={projectId} executionId={executionId} />
       <h4>{stages[r.startupState]}</h4>
       <p>
         启动观察：已完成 {r.completedSteps} 个实际 Agent 步骤，持续启动要求至少 3
@@ -149,5 +152,55 @@ export function ExecutionObservation({
       <p>{query.data.coordinationBasis}</p>
       <p>{query.data.unavailableActions.join('；')}</p>
     </section>
+  );
+}
+export function ExecutionObservation({
+  projectId,
+  ticketId,
+  executionId,
+}: {
+  projectId: string;
+  ticketId: string;
+  executionId: string | null;
+}) {
+  const [choice, setChoice] = useState<string | null>(null),
+    query = useQuery({
+      queryKey: ['ticket-executions', projectId, ticketId],
+      queryFn: async () =>
+        z
+          .array(executionSchema)
+          .parse(await request(`/api/projects/${projectId}/executions`))
+          .filter((value) => value.ticketId === ticketId),
+    });
+  if (query.isPending) return <p role="status">正在读取执行历史…</p>;
+  if (query.isError) return <p role="alert">{query.error.message}</p>;
+  const attempts = query.data,
+    selected =
+      choice && attempts.some((value) => value.id === choice)
+        ? choice
+        : (executionId ?? attempts.at(-1)?.id);
+  if (!selected) return <p>尚无正式派工。请通过 Chat 向主管提出单票派工要求。</p>;
+  return (
+    <>
+      <label>
+        执行尝试
+        <select
+          aria-label="执行尝试"
+          value={selected}
+          onChange={(event) => setChoice(event.target.value)}
+        >
+          {attempts.map((value) => (
+            <option key={value.id} value={value.id}>
+              {value.id === executionId ? '当前执行' : '历史尝试'} · {value.id} ·{' '}
+              {value.lifecycleState}
+            </option>
+          ))}
+        </select>
+      </label>
+      {selected !== executionId && (
+        <p>正在回查历史尝试，保留记录不表示仍在执行，也不会因查询复活原会话。</p>
+      )}
+      <ExecutionRecordObservation key={selected} projectId={projectId} executionId={selected} />
+    </>
   );
 }

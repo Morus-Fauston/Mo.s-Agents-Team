@@ -12,6 +12,7 @@ import { streamSSE } from 'hono/streaming';
 import { chatInputSchema } from '../契约/私聊.ts';
 import { checkReferences, readReferenceText } from '../业务/引用文件.ts';
 import { createWorkbenchRoutes } from './工作台接口.ts';
+import { controlInputSchema } from '../契约/控制.ts';
 const attachment = z.object({ root: z.string().min(1) }).strict();
 export function createApplication(
   service: ProjectService,
@@ -40,6 +41,62 @@ export function createApplication(
     return c.json({ code: 'OPERATION_FAILED', message: error.message }, 400);
   });
   app.route('/api/projects', createWorkbenchRoutes(service));
+  app.get('/api/projects/:project/control', (c) => {
+    const id = c.req.param('project');
+    return c.json(
+      runtime?.projectControl
+        ? runtime.projectControl.query(id)
+        : {
+            runtime: service.forProject(id).controls().project(),
+            desiredStarted: service.forProject(id).snapshot().started,
+            available: false,
+          },
+    );
+  });
+  app.post('/api/projects/:project/control', async (c) => {
+    if (!runtime?.projectControl) throw new ProjectError('HOST_UNAVAILABLE', '宿主未连接项目控制');
+    const input = z
+      .object({
+        operationId: z.uuid(),
+        action: z.enum(['start', 'stop', 'force-stop']),
+        reason: z.string().trim().min(1),
+      })
+      .strict()
+      .parse(await c.req.json());
+    return c.json(
+      input.action === 'start'
+        ? runtime.projectControl.start(c.req.param('project'), input)
+        : runtime.projectControl.stop(c.req.param('project'), input, input.action === 'force-stop'),
+      202,
+    );
+  });
+  app.get('/api/projects/:project/executions/:execution/control', (c) => {
+    const id = c.req.param('project'),
+      execution = z.uuid().parse(c.req.param('execution')),
+      catalog = service.forProject(id).controls();
+    return c.json(
+      runtime?.controls
+        ? runtime.controls.query(id, execution)
+        : {
+            revision: catalog.revision(execution),
+            controls: catalog.list(execution),
+            jobs: catalog.jobs(execution),
+            available: false,
+          },
+    );
+  });
+  app.post('/api/projects/:project/executions/:execution/control', async (c) => {
+    if (!runtime?.controls) throw new ProjectError('HOST_UNAVAILABLE', '宿主未连接执行控制');
+    const input = controlInputSchema.omit({ executionId: true }).parse(await c.req.json());
+    return c.json(
+      runtime.controls.request(
+        c.req.param('project'),
+        { kind: 'user' },
+        { ...input, executionId: z.uuid().parse(c.req.param('execution')) },
+      ),
+      202,
+    );
+  });
   app.get('/api/projects', (c) => c.json(service.list()));
   app.post('/api/projects', async (c) => {
     const data = initializeSchema.parse(await c.req.json());
@@ -52,9 +109,11 @@ export function createApplication(
     };
     return c.json(service.create({ root: data.root, name: data.name, supervisor }), 201);
   });
-  app.post('/api/projects/attach', async (c) =>
-    c.json(service.attach(attachment.parse(await c.req.json()).root)),
-  );
+  app.post('/api/projects/attach', async (c) => {
+    const project = service.attach(attachment.parse(await c.req.json()).root);
+    runtime?.projectControl?.attached(project.id);
+    return c.json(project);
+  });
   app.get('/api/runtime', (c) =>
     c.json({
       available: !!runtime,

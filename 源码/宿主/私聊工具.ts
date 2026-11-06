@@ -5,6 +5,7 @@ import type { CommunicationService } from '../业务/私聊服务.ts';
 import { messageIdentity } from '../业务/消息呈递.ts';
 import { fileReferenceSchema } from '../契约/私聊.ts';
 import { ProjectError } from '../业务/错误.ts';
+import type { ExecutionControlService } from '../业务/执行控制.ts';
 interface Caller {
   connection: ProjectConnection;
   sessionId: string;
@@ -33,6 +34,9 @@ function page<T>(items: T[], offset: number) {
   return { entries, nextOffset: cursor < items.length ? cursor : null, total: items.length };
 }
 const chatSchema = z.union([
+  z
+    .object({ action: z.literal('hangup'), controlId: z.uuid(), content: z.string().trim().min(1) })
+    .strict(),
   z.object({ retryMessageId: z.uuid() }).strict(),
   z
     .object({
@@ -49,6 +53,7 @@ export function installCommunicationTools(
   modules: NativeModules,
   resolve: (agent: NativeAgent) => Caller,
   communication: CommunicationService,
+  controls?: ExecutionControlService,
 ): void {
   const caller = (exec: Execution) => {
     if (exec.agent !== owner)
@@ -98,8 +103,10 @@ export function installCommunicationTools(
   );
   register(
     'mat_chat',
-    '向明确会话发送普通私聊，或用retryMessageId重试自己原消息。不等待对方回复。保存、内存接纳、持久接纳、进入模型和业务办理分开；未知结果先查询原消息，不换新身份盲发。当前不支持完成/挂起、派工或控制动作。',
+    '向明确会话普通私聊，或重试原消息。软停止要求的正式挂起回报使用action=hangup、controlId和content，不填写target；须说明保存内容、后台状态与恢复位置。完成交回待后续接入。',
     {
+      action: { type: 'string', description: '挂起回报填hangup，普通聊天省略' },
+      controlId: { type: 'string', description: '软停止要求中的准确控制ID' },
       target: { type: 'string', description: '通讯录或创建工具返回的完整会话地址，或有资格的user' },
       content: { type: 'string', description: '工作正文，Markdown原样保存' },
       replyTo: { type: 'string', description: '同一私聊内原消息ID' },
@@ -125,6 +132,12 @@ export function installCommunicationTools(
         projectId = source.connection.snapshot().id,
         actor = { kind: 'session' as const, sessionId: source.sessionId },
         input = chatSchema.parse(args);
+      if ('action' in input) {
+        if (!controls) throw new ProjectError('CONTROL_UNAVAILABLE', '执行控制尚未接入');
+        return encode(
+          await controls.handoff(projectId, source.sessionId, input.controlId, input.content),
+        );
+      }
       let saved;
       if ('retryMessageId' in input)
         saved = await communication.retry(projectId, actor, input.retryMessageId);

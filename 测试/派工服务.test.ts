@@ -9,6 +9,9 @@ import type { DispatchHost } from '../源码/业务/派工服务.ts';
 import type { NativeAgent } from '../源码/宿主/原生接口.ts';
 import type { NativeGoalView } from '../源码/契约/执行.ts';
 import type { RequestRecord } from '../源码/契约/装配.ts';
+import { ExecutionControlService } from '../源码/业务/执行控制.ts';
+import type { NativeContext } from '../源码/宿主/原生接口.ts';
+import type { CommunicationService } from '../源码/业务/私聊服务.ts';
 async function fixture() {
   const directory = mkdtempSync(join(tmpdir(), 'mat-dispatch-service-')),
     root = join(directory, '项目');
@@ -102,6 +105,10 @@ async function fixture() {
     flush: async () => true,
     notify: async (_project, input) => connection.messages().saveSystem(input),
   };
+  connection
+    .controls()
+    .startProject({ kind: 'user' }, { operationId: randomUUID(), reason: '单测明确启动' }, 'unit');
+  connection.controls().projectReady('unit', manager.id);
   const service = new DispatchService(projects, host),
     actor = { kind: 'session' as const, sessionId: manager.id },
     input = {
@@ -114,6 +121,7 @@ async function fixture() {
     };
   return {
     root,
+    projects,
     project,
     connection,
     service,
@@ -213,6 +221,71 @@ async function startedFixture() {
   };
   return { ...f, record, agent, current, event, step };
 }
+test('运行服务软停止只disarm并投递平台要求，不调用cancel或kill', async () => {
+  const f = await startedFixture();
+  let cancelled = 0,
+    killed = 0,
+    disarmed = 0,
+    paused = 0;
+  const native = {
+    goals: {
+      get: () => f.host.getGoal(f.agent),
+      disarm: () => {
+        disarmed++;
+        const goal = f.host.getGoal(f.agent)!;
+        goal.activation = 'disarmed';
+        return goal;
+      },
+      pause: () => {
+        paused++;
+      },
+    },
+    jobs: {
+      kill: () => {
+        killed++;
+      },
+    },
+    sessions: { flush: async () => true },
+  } as unknown as NativeContext;
+  f.agent.cancel = () => {
+    cancelled++;
+  };
+  const communication = {
+    sendControl: async (_project: string, id: string, kind: 'request' | 'resume') =>
+      f.connection.messages().recordControl(id, kind),
+  } as unknown as CommunicationService;
+  const control = new ExecutionControlService(f.projects, f.service, communication, {
+    native,
+    peek: () => f.agent,
+    openControlled: async () => f.agent,
+    freshContext: async () => ({ unit: true }),
+  });
+  try {
+    const registered = control.request(
+      f.project.id,
+      { kind: 'user' },
+      {
+        operationId: randomUUID(),
+        executionId: f.record.id,
+        action: 'soft-stop',
+        reason: '单测安全收尾',
+        expectedRevision: 0,
+      },
+    );
+    expect(registered.status).toBe('requested');
+    await expect.poll(() => f.connection.controls().get(registered.id).status).toBe('delivered');
+    expect(disarmed).toBe(1);
+    expect(cancelled).toBe(0);
+    expect(killed).toBe(0);
+    expect(paused).toBe(0);
+    expect(f.connection.executions().get(f.record.id).lifecycleState).toBe('active');
+    expect(f.connection.executions().get(f.record.id).writeOccupancy).toBe('pending-release');
+    expect(f.connection.messages().get(registered.messageId).message.sender.kind).toBe('system');
+  } finally {
+    await control.close();
+    await f.close();
+  }
+});
 test('第三步结束后的异步hook失败不提前确认启动，故障与通知沿同次身份保存', async () => {
   const f = await startedFixture();
   try {

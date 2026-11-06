@@ -66,6 +66,7 @@ export class DispatchService {
   }
   dispatch(projectId: string, actor: WorkbenchActor, raw: unknown): ExecutionRecord {
     if (this.closed) throw new ProjectError('DISPATCH_CLOSED', '派工服务正在关闭');
+    this.projects.forProject(projectId).controls().requireDispatch();
     const input = dispatchInputSchema.parse(raw);
     const catalog = this.catalog(projectId),
       result = catalog.register(actor, input, this.epoch, (scopes) =>
@@ -84,6 +85,12 @@ export class DispatchService {
     let mayHaveStarted = false;
     try {
       let value = catalog.get(id);
+      const requireStart = () => {
+        connection.controls().requireDispatch();
+        if (connection.controls().activeControl(id))
+          throw new ProjectError('EXECUTION_CONTROLLED', '准备期间已接纳控制，未启动新Goal');
+      };
+      requireStart();
       if (this.closed) throw new ProjectError('DISPATCH_CLOSED', '宿主正在关闭，未继续启动');
       let session: SessionRecord;
       if (value.sessionId) {
@@ -173,6 +180,7 @@ export class DispatchService {
       if (latestGoal && latestGoal.phase !== 'complete')
         throw new ProjectError('OLD_GOAL_UNFINISHED', '准备期间出现未收尾Goal，未替换');
       if (this.closed) throw new ProjectError('DISPATCH_CLOSED', '宿主关闭前未武装新Goal');
+      requireStart();
       mayHaveStarted = true;
       const goal = this.host.createGoal(agent, {
         objective,
@@ -186,6 +194,13 @@ export class DispatchService {
         );
       catalog.goalDurable(id);
     } catch (error) {
+      if (
+        error instanceof ProjectError &&
+        ['PROJECT_NOT_STARTED', 'EXECUTION_CONTROLLED', 'PROJECT_OR_EXECUTION_CONTROLLED'].includes(
+          error.code,
+        )
+      )
+        return;
       const value = catalog.get(id);
       const unknown =
         mayHaveStarted ||
@@ -392,6 +407,20 @@ export class DispatchService {
         materialReadRoot: ticket.materialRoot,
         materialWriteDomain: domain.path,
         managerSessionIds: value.managerSessionIds,
+        control: (() => {
+          const control = connection.controls().activeControl(value.id);
+          return control
+            ? {
+                id: control.id,
+                revision: control.revision,
+                action: control.action,
+                status: control.status,
+                reason: control.reason,
+                content: control.content,
+                reportSaved: !!control.report,
+              }
+            : null;
+        })(),
         goalId: value.goalId,
         completionPolicy:
           '普通消息和idle不结票；按平台正式交回及后续审阅办理，当前不自行批准或假填人工项。',
@@ -450,7 +479,12 @@ export class DispatchService {
         .workbench()
         .materialDomains(record.ticketId)
         .filter((domain) => domain.referenceId === record.id),
-      unavailableActions: ['正式执行控制待07接入', '交付版本待08接入', '完成交回和独审待09接入'],
+      control: {
+        revision: connection.controls().revision(record.id),
+        controls: connection.controls().list(record.id),
+        jobs: connection.controls().jobs(record.id),
+      },
+      unavailableActions: ['交付版本待08接入', '完成交回和独审待09接入'],
       coordinationBasis: '当前插件可取得的声明写域；不是OS文件锁或外部作业停稳证明',
     };
   }

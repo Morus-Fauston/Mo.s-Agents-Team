@@ -12,6 +12,9 @@ import { ExplicitSkillGrants } from './本次Skill许可.ts';
 import { loadNativeModules } from './原生接口.ts';
 import { CommunicationService } from '../业务/私聊服务.ts';
 import { DispatchService } from '../业务/派工服务.ts';
+import { ExecutionControlService } from '../业务/执行控制.ts';
+import { ProjectControlService } from '../业务/项目控制.ts';
+import { NativeProcessRanges } from './进程范围观察.ts';
 import { installExecutionTools } from './执行工具.ts';
 import { installCommunicationTools } from './私聊工具.ts';
 import { installWorkbenchTools } from './工作台工具.ts';
@@ -57,6 +60,8 @@ interface Binding {
 export interface SessionRuntime {
   readonly communication: CommunicationService;
   readonly dispatch?: DispatchService;
+  readonly controls?: ExecutionControlService;
+  readonly projectControl?: ProjectControlService;
   create(projectId: string, input: SessionInput): Promise<SessionRecord>;
   configuration(projectId: string, sessionId: string): unknown;
   close(): Promise<void>;
@@ -64,6 +69,9 @@ export interface SessionRuntime {
 export class HostSessionRuntime implements SessionRuntime {
   readonly communication: CommunicationService;
   readonly dispatch: DispatchService;
+  readonly controls: ExecutionControlService;
+  readonly projectControl: ProjectControlService;
+  private readonly ranges: NativeProcessRanges;
   private readonly ctx: NativeContext;
   private readonly projects: ProjectService;
   private readonly modules: NativeModules;
@@ -76,6 +84,12 @@ export class HostSessionRuntime implements SessionRuntime {
     this.ctx = ctx;
     this.projects = projects;
     this.modules = modules;
+    this.ranges = new NativeProcessRanges(ctx, (fact) =>
+      projects
+        .forProject(fact.projectId)
+        .controls()
+        .saveManagedRange(fact.sessionId, fact.callId, fact),
+    );
     this.communication = new CommunicationService(projects, {
       open: (project, session) => this.open(project, session),
       flush: (agent) => ctx.sessions.flush(agent.session),
@@ -98,6 +112,54 @@ export class HostSessionRuntime implements SessionRuntime {
       flush: (agent) => ctx.sessions.flush(agent.session),
       notify: (project, input) => this.communication.sendSystem(project, input),
     });
+    this.controls = new ExecutionControlService(projects, this.dispatch, this.communication, {
+      unassociatedProcesses: (session, associated) =>
+        this.ranges
+          .forSession(session)
+          .filter((fact) => fact.state !== 'gone' && !associated.includes(fact.id)).length,
+      native: ctx,
+      peek: (project, session) => this.peek(project, session),
+      openControlled: (project, session) => this.openControlled(project, session),
+      freshContext: async (project, id, agent) => {
+        const connection = projects.forProject(project),
+          session = connection.session(id),
+          role = connection.roles().find((role) => role.id === session.roleId)!;
+        const cwd = await ctx.workingDirectory.ensure(agent),
+          context = assembleContext(connection.snapshot(), role, session, cwd);
+        return {
+          cwd,
+          sources: context.sources,
+          version: context.version,
+          configuration: agent.model.current(),
+        };
+      },
+    });
+    this.projectControl = new ProjectControlService(
+      projects,
+      this.controls,
+      this.communication,
+      {
+        unsettledProcesses: (session) =>
+          this.ranges.forSession(session).filter((fact) => fact.state !== 'gone').length,
+        native: ctx,
+        peek: (project, session) => this.peek(project, session),
+        openControlled: (project, session) => this.openControlled(project, session),
+        createManager: (project, reserved) => {
+          const connection = projects.forProject(project);
+          return this.create(
+            project,
+            {
+              roleId: connection.roles().find((role) => role.type === 'supervisor')!.id,
+              name: '项目主管默认入口',
+              purpose: '项目启动和已授权工作管理',
+              cwd: connection.snapshot().root,
+            },
+            reserved,
+          );
+        },
+      },
+      this.dispatch.epoch,
+    );
   }
   static async start(ctx: NativeContext, projects: ProjectService): Promise<HostSessionRuntime> {
     if (!ctx.agentPresets)
@@ -126,6 +188,15 @@ export class HostSessionRuntime implements SessionRuntime {
         ctx.on('session/event', (session, event) => {
           const found = [...runtime.bindings].find(([agent]) => agent.id === session.id);
           if (!found) return;
+          runtime.controls.nativeEvent(
+            found[1].connection.snapshot().id,
+            found[1].session.id,
+            found[0],
+            event,
+          );
+          if (event.type === 'job/registered')
+            for (const fact of runtime.ranges.forSession(found[1].session.id))
+              found[1].connection.controls().saveManagedRange(fact.sessionId, fact.callId, fact);
           runtime.dispatch.observe(
             found[1].connection.snapshot().id,
             found[1].session.id,
@@ -178,6 +249,7 @@ export class HostSessionRuntime implements SessionRuntime {
             );
         }),
       );
+      runtime.projectControl.startLoaded();
       return runtime;
     } catch (error) {
       await runtime.close();
@@ -255,6 +327,8 @@ export class HostSessionRuntime implements SessionRuntime {
   ): Promise<void> {
     const role = connection.roles().find((role) => role.id === session.roleId)!;
     await this.ctx.agentPresets!.mount(agentCtx, `mat-${role.type}`);
+    if (!agent.session.snapshotEvents().some((event) => event.type === 'sandbox/mode'))
+      this.modules.setSandboxMode(agent.session, 'danger-full-access');
     const allowed = [
       ...basic,
       'skill',
@@ -316,6 +390,7 @@ export class HostSessionRuntime implements SessionRuntime {
         return { connection: binding.connection, sessionId: binding.session.id };
       },
       this.communication,
+      this.controls,
     );
     installWorkbenchTools(agentCtx, agent, this.modules, role.type, (caller) => {
       const binding = this.requireBinding(caller);
@@ -331,7 +406,11 @@ export class HostSessionRuntime implements SessionRuntime {
         return { connection: binding.connection, sessionId: binding.session.id };
       },
       this.dispatch,
+      this.controls,
     );
+    this.ranges.install(agentCtx, agent, connection.snapshot().id, session.id, (caller) => {
+      this.requireBinding(caller);
+    });
   }
   peek(projectId: string, sessionId: string): NativeAgent | undefined {
     const agent = [...this.bindings].find(
@@ -342,10 +421,21 @@ export class HostSessionRuntime implements SessionRuntime {
     return agent;
   }
   async open(projectId: string, sessionId: string): Promise<NativeAgent> {
+    if (!this.controls.admission(projectId, sessionId))
+      throw new ProjectError(
+        'PROJECT_OR_EXECUTION_CONTROLLED',
+        '项目未启动或当前入口受控制，消息仅保留',
+      );
+    return this.openControlled(projectId, sessionId);
+  }
+  async openControlled(projectId: string, sessionId: string): Promise<NativeAgent> {
     if (this.closed) throw new ProjectError('RUNTIME_CLOSED', '会话服务已经关闭');
     const connection = this.projects.forProject(projectId);
     const session = connection.session(sessionId);
-    if (session.status !== 'bound' || session.communicationState !== 'active')
+    if (
+      session.status !== 'bound' ||
+      ['terminated', 'archived'].includes(session.communicationState)
+    )
       throw new ProjectError('TARGET_CONTROLLED', '目标不是可接纳的活跃入口，不因聊天恢复');
     const existing = [...this.bindings].find(
       ([, binding]) => binding.connection === connection && binding.session.id === sessionId,
@@ -420,6 +510,19 @@ export class HostSessionRuntime implements SessionRuntime {
     const preset = this.ctx.agentPresets?.composedPreset(input.agent.ctx);
     if (!this.bindings.has(input.agent) && !preset?.startsWith('mat-')) return next();
     const binding = this.requireBinding(input.agent);
+    const current = binding.connection.session(binding.session.id);
+    if (current.status !== 'bound' || current.communicationState !== 'active')
+      return {
+        kind: 'reject',
+        reason: '当前入口受暂停、终止或封存控制；普通输入和原生通知不能解除',
+      };
+    if (!this.controls.admission(binding.connection.snapshot().id, binding.session.id))
+      return { kind: 'reject', reason: '项目或当前控制尚未允许继续；查询和原生消息不解除限制' };
+    this.controls.assertModelGoal(
+      binding.connection.snapshot().id,
+      binding.session.id,
+      input.agent,
+    );
     const role = binding.connection.roles().find((r) => r.id === binding.session.roleId)!;
     const cwd = await this.ctx.workingDirectory.ensure(input.agent, input.signal);
     const context = assembleContext(binding.connection.snapshot(), role, binding.session, cwd);
@@ -503,6 +606,11 @@ export class HostSessionRuntime implements SessionRuntime {
         execution.version
     )
       messages.push(execution.message);
+    this.controls.assertModelGoal(
+      binding.connection.snapshot().id,
+      binding.session.id,
+      input.agent,
+    );
     return { ...decision, messages };
   }
   private trackRequest(
@@ -607,12 +715,20 @@ export class HostSessionRuntime implements SessionRuntime {
       requests: connection.requests(sessionId),
       nativeLoaded: !!native,
       usageAvailability: '每次请求独立保存；null表示宿主未提供',
-      unavailableActions: ['审计', '执行控制', '交接保存'],
+      unavailableActions: ['审计', '交接保存'],
+      processRangeObservation: this.ranges.available,
+      sandboxMode: native
+        ? (native.session.snapshotEvents().findLast((event) => event.type === 'sandbox/mode')?.data
+            .mode ?? null)
+        : null,
     };
   }
   async close() {
     if (this.closed) return;
     this.closed = true;
+    await this.projectControl.close();
+    await this.controls.close();
+    this.ranges.close();
     await this.dispatch.close();
     await this.communication.close();
     await Promise.allSettled([...this.openings.values()]);

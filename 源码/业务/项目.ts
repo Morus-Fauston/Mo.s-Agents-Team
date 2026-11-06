@@ -23,6 +23,7 @@ import { RequestCatalog } from '../存储/请求记录.ts';
 import { MessageCatalog, migrateMessages } from '../存储/消息记录.ts';
 import { WorkbenchCatalog, migrateWorkbench } from '../存储/工作台记录.ts';
 import { ExecutionCatalog, migrateExecutions } from '../存储/执行记录.ts';
+import { ControlCatalog, migrateControls } from '../存储/控制记录.ts';
 export { ProjectError } from './错误.ts';
 export type {
   ExecutionConfiguration,
@@ -128,7 +129,7 @@ function view(db: DatabaseSync, root: string): ProjectView {
 }
 function migrate(db: DatabaseSync): void {
   const version = Number(db.prepare('PRAGMA user_version').get()?.user_version);
-  if (version > 6) throw new ProjectError('FUTURE_SCHEMA', '数据库版本高于当前软件，拒绝降级写入');
+  if (version > 7) throw new ProjectError('FUTURE_SCHEMA', '数据库版本高于当前软件，拒绝降级写入');
   if (version === 0) {
     db.exec(`CREATE TABLE project(singleton INTEGER PRIMARY KEY CHECK(singleton=1),id TEXT NOT NULL UNIQUE,name TEXT NOT NULL,attached INTEGER NOT NULL DEFAULT 0 CHECK(attached IN(0,1)),started INTEGER NOT NULL DEFAULT 0 CHECK(started IN(0,1)));
       CREATE TABLE role(id TEXT PRIMARY KEY,code TEXT NOT NULL UNIQUE,type TEXT NOT NULL,configuration TEXT NOT NULL);
@@ -140,6 +141,7 @@ function migrate(db: DatabaseSync): void {
   if (version < 4) migrateMessages(db);
   if (version < 5) migrateWorkbench(db);
   if (version < 6) migrateExecutions(db);
+  if (version < 7) migrateControls(db);
 }
 export function initializeProject(input: InitializeInput): ProjectView {
   if (!input || typeof input.name !== 'string' || !input.name.trim() || input.name.length > 160)
@@ -261,6 +263,7 @@ export function readProject(inputRoot: string): ProjectView {
   }
 }
 export interface ProjectConnection {
+  controls(): ControlCatalog;
   executions(): ExecutionCatalog;
   workbench(): WorkbenchCatalog;
   messages(): MessageCatalog;
@@ -295,7 +298,7 @@ export function connectProject(inputRoot: string): ProjectConnection {
   try {
     db.exec('PRAGMA foreign_keys=ON');
     const version = Number(db.prepare('PRAGMA user_version').get()?.user_version);
-    if (version < 1 || version > 6)
+    if (version < 1 || version > 7)
       throw new ProjectError('SCHEMA_MISMATCH', '项目数据库版本不匹配，请先核对升级与初始化结果');
     db.exec('PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE');
     try {
@@ -313,11 +316,20 @@ export function connectProject(inputRoot: string): ProjectConnection {
     const messages = new MessageCatalog(db, sessions, roles, view(db, root).id);
     const workbench = new WorkbenchCatalog(db, root, sessions, roles);
     const executions = new ExecutionCatalog(db, sessions, roles, workbench);
+    const controls = new ControlCatalog(db, workbench, executions, sessions);
+    messages.bindControlledMessages(
+      (id, session) => controls.resultMessage(id, session),
+      (id, kind) => controls.controlMessage(id, kind),
+    );
     workbench.bindExecutionAccess((id) => executions.scopeForSession(id));
     const requireOpen = () => {
       if (closed) throw new ProjectError('CONNECTION_CLOSED', '项目连接已经关闭');
     };
     return {
+      controls() {
+        requireOpen();
+        return controls;
+      },
       executions() {
         requireOpen();
         return executions;

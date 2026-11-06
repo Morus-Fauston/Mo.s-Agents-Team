@@ -28,6 +28,35 @@ export function migrateMessages(db: DatabaseSync): void {
  PRAGMA user_version=4;`);
 }
 export class MessageCatalog {
+  private controlledResult: ((id: string, sessionId: string) => ChatInput | undefined) | undefined;
+  private controlMessage: ((id: string, kind: 'request' | 'resume') => ChatInput) | undefined;
+  bindControlledMessages(
+    result: (id: string, sessionId: string) => ChatInput | undefined,
+    control: (id: string, kind: 'request' | 'resume') => ChatInput,
+  ): void {
+    this.controlledResult = result;
+    this.controlMessage = control;
+  }
+  recordControlledResult(id: string, sessionId: string): SavedMessage {
+    const input = this.controlledResult?.(id, sessionId);
+    if (!input) throw new ProjectError('CONTROL_RESULT_REQUIRED', '没有此会话已保存的正式挂起回报');
+    return this.recordOutput({ kind: 'session', sessionId }, input);
+  }
+  recordControl(id: string, kind: 'request' | 'resume'): SavedMessage {
+    if (!this.controlMessage) throw new ProjectError('CONTROL_UNAVAILABLE', '控制消息尚未接入');
+    return this.saveInternal({ kind: 'system' }, this.controlMessage(id, kind), false);
+  }
+  private allowsControlledResult(id: string, sessionId: string): boolean {
+    const expected = this.controlledResult?.(id, sessionId);
+    if (!expected) return false;
+    const saved = this.get(id);
+    return (
+      saved.message.sender.sessionId === sessionId &&
+      saved.message.content === expected.content &&
+      saved.receipt.targetSessionId === this.resolveTarget(expected.target).id &&
+      saved.message.references.length === 0
+    );
+  }
   private readonly db: DatabaseSync;
   private readonly sessions: SessionCatalog;
   private readonly roles: RoleCatalog;
@@ -348,7 +377,10 @@ export class MessageCatalog {
       const sender = this.get(id).message.sender;
       if (sender.sessionId !== null) {
         const source = this.sessions.get(sender.sessionId);
-        if (source.status !== 'bound' || source.communicationState !== 'active') {
+        if (
+          (source.status !== 'bound' || source.communicationState !== 'active') &&
+          !this.allowsControlledResult(id, source.id)
+        ) {
           receipt.state = 'held';
           receipt.error = '来源已受控制或结束：保留旧消息，不自动推进';
           return;

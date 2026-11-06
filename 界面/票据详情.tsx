@@ -796,7 +796,11 @@ export function TicketDetails({
       {view === 'logs' && <Logs path={path} projectId={projectId} run={run} />}
       {view === 'materials' && <Materials path={path} projectId={projectId} />}
       {view === 'execution' && (
-        <ExecutionObservation projectId={projectId} executionId={ticket.currentExecution} />
+        <ExecutionObservation
+          projectId={projectId}
+          ticketId={ticket.id}
+          executionId={ticket.currentExecution}
+        />
       )}
       {view === 'revisions' && <Revisions path={path} projectId={projectId} />}
     </section>

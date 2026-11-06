@@ -12,6 +12,16 @@ export interface NativeEvent {
   data: Record<string, unknown>;
   surfaceOp?: unknown;
 }
+export interface NativeJobView {
+  id: string;
+  owner?: string;
+  kind: string;
+  label: string;
+  status: string;
+  startedAt: number;
+  finishedAt?: number;
+  detail?: string;
+}
 export interface NativeAgent {
   id: string;
   ctx: NativeContext;
@@ -20,6 +30,7 @@ export interface NativeAgent {
     current(): ExecutionConfiguration | undefined;
     select(configuration: ExecutionConfiguration): unknown;
   };
+  cancel(cause: { kind: 'user' }, options?: { keepInbox?: boolean }): unknown;
   steer(message: NativeMessage): void;
   inject(message: NativeMessage): void;
   whenIdle(): Promise<void>;
@@ -45,6 +56,7 @@ export interface StepInput {
 export type StepDecision =
   { kind: 'enter'; messages: NativeMessage[] } | { kind: 'reject'; reason?: unknown };
 export interface NativeContext {
+  subprocess?: { spawn(spec: unknown): unknown };
   effect(
     callback: () => void | (() => void | Promise<void>) | Promise<() => void | Promise<void>>,
   ): unknown;
@@ -96,6 +108,12 @@ export interface NativeContext {
   };
   goals?: {
     get(agent: NativeAgent): NativeGoalView | undefined;
+    disarm(agent: NativeAgent): NativeGoalView | undefined;
+    edit(
+      agent: NativeAgent,
+      ref: { id: string; revision: number },
+      input: { objective?: string; maxGoalRounds?: number },
+    ): NativeGoalView;
     create(
       agent: NativeAgent,
       input: { objective: string; maxGoalRounds?: number },
@@ -103,6 +121,17 @@ export interface NativeContext {
     pause(agent: NativeAgent, ref: { id: string; revision: number }): NativeGoalView;
     resume(agent: NativeAgent, ref: { id: string; revision: number }): NativeGoalView;
     clear(agent: NativeAgent, ref: { id: string; revision: number }): unknown;
+  };
+  jobs?: {
+    list(caller?: string): NativeJobView[];
+    get(id: string, caller?: string): NativeJobView;
+    kill(id: string, caller?: string, reason?: string): NativeJobView;
+    wait(
+      id: string,
+      timeoutMs: number,
+      caller?: string,
+      signal?: AbortSignal,
+    ): Promise<NativeJobView>;
   };
   sessions: { flush(session: NativeAgent['session']): Promise<boolean> };
   agentPresets?: {
@@ -153,6 +182,7 @@ export interface NativeSkillProvider {
   dispose(): Promise<void>;
 }
 export interface NativeModules {
+  setSandboxMode(session: NativeAgent['session'], mode: 'danger-full-access'): void;
   defineTool(options: unknown): ToolDefinition;
   FileSystemSkillProvider: new (
     ctx: NativeContext,
@@ -172,15 +202,18 @@ export async function loadNativeModules(ctx: NativeContext): Promise<NativeModul
     tree.import('@deepseek-ai/dsh-tools'),
     tree.import('@deepseek-ai/dsh-skill-filesystem'),
     tree.import('@deepseek-ai/dsh-skill'),
+    tree.import('@deepseek-ai/dsh-sandbox-policy'),
   ]);
   const tools = results[0] as Pick<NativeModules, 'defineTool'>;
   const filesystem = results[1] as Pick<NativeModules, 'FileSystemSkillProvider'>;
   const skills = results[2] as Pick<NativeModules, 'renderSkillContent'>;
+  const policy = results[3] as Pick<NativeModules, 'setSandboxMode'>;
   if (
     typeof tools.defineTool !== 'function' ||
     typeof filesystem.FileSystemSkillProvider !== 'function' ||
-    typeof skills.renderSkillContent !== 'function'
+    typeof skills.renderSkillContent !== 'function' ||
+    typeof policy.setSandboxMode !== 'function'
   )
     throw new Error('当前DSH缺少已核对的工具或Skill原生接口');
-  return { ...tools, ...filesystem, ...skills };
+  return { ...tools, ...filesystem, ...skills, setSandboxMode: policy.setSandboxMode };
 }

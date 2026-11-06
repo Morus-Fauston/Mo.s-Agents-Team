@@ -16,6 +16,7 @@ import type { ProjectView } from '../源码/契约/项目';
 import styles from './工作台.module.css';
 import { request } from './请求';
 import { RoleAndSessionPanel } from './角色与会话';
+import { ProjectControls } from './控制入口';
 const ChatPanel = lazy(() => import('./私聊').then((module) => ({ default: module.ChatPanel })));
 const TicketWorkbench = lazy(() =>
   import('./票据工作台').then((module) => ({ default: module.TicketWorkbench })),
@@ -138,6 +139,7 @@ function ProjectDetails({ project }: { project: ProjectView }) {
         <dt>共用规范</dt>
         <dd>{project.paths.team}</dd>
       </dl>
+      <ProjectControls projectId={project.id} />
       <div className={styles.tabs} role="tablist" aria-label="项目视图">
         <button
           type="button"

@@ -22,6 +22,8 @@ export const inject = [
   'agentPresets',
   'sessions',
   'goals',
+  'jobs',
+  'subprocess',
 ];
 export function apply(ctx: PluginContext & NativeContext, config: PluginConfiguration = {}): void {
   ctx.effect(() => {

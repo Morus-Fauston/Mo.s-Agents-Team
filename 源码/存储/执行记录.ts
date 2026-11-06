@@ -170,6 +170,18 @@ export class ExecutionCatalog {
       }
       const ticket = this.wb.getTicket(input.ticket),
         phase = this.wb.getPhase(ticket.phaseId);
+      if (
+        this.list().some(
+          (value) =>
+            value.ticketId === ticket.id &&
+            ['terminated', 'closed'].includes(value.lifecycleState) &&
+            value.writeOccupancy !== 'released',
+        )
+      )
+        throw new ProjectError(
+          'OLD_EXECUTION_NOT_QUIESCENT',
+          '原尝试尚未停稳，不能对同票盲目另开替代执行',
+        );
       if (phase.state !== 'opened')
         throw new ProjectError('PHASE_NOT_OPENED', '所属期次未开放，不能因聊天或计划开工');
       if (

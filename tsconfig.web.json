@@ -13,5 +13,5 @@
     "types": ["vite/client"],
     "skipLibCheck": true
   },
-  "include": ["界面/**/*.ts", "界面/**/*.tsx"]
+  "include": ["web/**/*.ts", "web/**/*.tsx"]
 }

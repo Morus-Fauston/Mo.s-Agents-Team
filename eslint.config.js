@@ -6,11 +6,11 @@ export default tseslint.config(
   },
   ...tseslint.configs.recommended,
   {
-    files: ['脚本/**/*.mjs'],
+    files: ['scripts/**/*.mjs'],
     languageOptions: { globals: { process: 'readonly', console: 'readonly' } },
   },
   {
-    files: ['界面/**/*.{ts,tsx}'],
+    files: ['web/**/*.{ts,tsx}'],
     plugins: { 'react-hooks': hooks },
     rules: { ...hooks.configs.recommended.rules },
   },

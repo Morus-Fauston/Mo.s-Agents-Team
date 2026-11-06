@@ -1,5 +1,5 @@
 # 黑名单式忽略规则：明确列出不公开的路径，其余默认纳入。
-# 当前公开范围仅根目录四份文档：README.md、CONTEXT.md、GLOSSARY.md、AGENTS.md。
+# 本地文档和参考资料按明确路径排除；产品源码与必要工程文件按本期授权纳入。
 # 新增顶层目录或文件前，先判断是否需要在此登记忽略。忽略规则不是访问控制。
 
 # 文档正文暂不公开，仅在本地维护
@@ -24,5 +24,14 @@
 /*.pem
 /*.key
 
-# 当前无构建工具、数据库或运行目录，不预设技术栈
-# 实现阶段按实际路径和公开边界补充，不使用 *.db 等全仓宽泛忽略
+# 本地依赖安装目录；保留 package.json 与 pnpm-lock.yaml
+node_modules/
+.pnpm-store/
+
+# 当前 TypeScript/Vite 工程的构建、覆盖率与本地缓存
+/dist/
+/coverage/
+/.vite/
+/.vitest/
+/.eslintcache
+*.tsbuildinfo

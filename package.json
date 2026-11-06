@@ -1,7 +1,7 @@
 {
   "name": "@mos/agents-team",
   "description": "Project initialization and local console for Mo's Agents Team.",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "private": true,
   "type": "module",
   "engines": {
@@ -9,18 +9,18 @@
   },
   "packageManager": "pnpm@11.28.5",
   "exports": {
-    ".": "./dist/宿主/插件.js",
-    "./locale/*.json": "./资源/语言/*.json",
-    "./icon": "./资源/图标.svg"
+    ".": "./dist/host/plugin.js",
+    "./locale/*.json": "./assets/locales/*.json",
+    "./icon": "./assets/icon.svg"
   },
   "bin": {
-    "mat": "./dist/命令/入口.js"
+    "mat": "./dist/cli/main.js"
   },
   "files": [
     "dist",
     "cordis.patch.yml",
     "pnpm-workspace.yaml",
-    "资源"
+    "assets"
   ],
   "dsh": {
     "bundle": {
@@ -29,15 +29,15 @@
   },
   "scripts": {
     "test": "vitest run",
-    "lint": "eslint 源码 界面 测试 脚本 *.config.ts",
-    "format:check": "prettier --check package.json pnpm-workspace.yaml tsconfig.*.json *.config.ts eslint.config.js .prettierrc.json cordis.patch.yml 源码 界面 测试 脚本 资源",
+    "lint": "eslint src web tests scripts *.config.ts",
+    "format:check": "prettier --check package.json pnpm-workspace.yaml tsconfig.*.json *.config.ts eslint.config.js .prettierrc.json cordis.patch.yml src web tests scripts assets",
     "typecheck:node": "tsc -p tsconfig.node.json --noEmit",
     "typecheck:web": "tsc -p tsconfig.web.json --noEmit",
     "build:node": "tsc -p tsconfig.node.json",
     "build:web": "vite build",
     "build": "pnpm run build:node && pnpm run build:web",
-    "package": "node 脚本/打包.mjs",
-    "mat": "node dist/命令/入口.js"
+    "package": "node scripts/package.mjs",
+    "mat": "node dist/cli/main.js"
   },
   "dependencies": {
     "react": "19.3.1",

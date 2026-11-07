@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import type { ProjectService } from '../services/project-service.ts';
 import { ProjectError } from '../services/errors.ts';
+import { previewImage, previewText } from '../services/material-preview.ts';
 export function createVersionRoutes(service: ProjectService) {
   const app = new Hono(),
     base = '/:project/executions/:execution/versions';
@@ -56,15 +57,18 @@ export function createVersionRoutes(service: ProjectService) {
         c.req.param('version'),
       ),
       root = z.coerce.number().int().nonnegative().parse(c.req.query('root')),
-      path = z.string().min(1).parse(c.req.query('path'));
-    return c.body(
-      new Uint8Array(versions.file(z.uuid().parse(c.req.param('version')), root, path)),
-      200,
-      {
-        'content-type': 'application/octet-stream',
-        'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(path.split(/[\\/]/).at(-1)!)}`,
-      },
-    );
+      path = z.string().min(1).parse(c.req.query('path')),
+      format = z.enum(['text', 'image']).optional().parse(c.req.query('preview')),
+      bytes = versions.file(z.uuid().parse(c.req.param('version')), root, path);
+    if (format === 'text') return c.json({ path, content: previewText(bytes) });
+    if (format === 'image') {
+      const image = previewImage(bytes);
+      return c.body(image.bytes, 200, image.headers);
+    }
+    return c.body(new Uint8Array(bytes), 200, {
+      'content-type': 'application/octet-stream',
+      'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(path.split(/[\\/]/).at(-1)!)}`,
+    });
   });
   return app;
 }

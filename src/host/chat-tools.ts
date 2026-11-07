@@ -8,6 +8,8 @@ import { ProjectError } from '../services/errors.ts';
 import type { ExecutionControlService } from '../services/execution-controls.ts';
 import type { CompletionService } from '../services/completion-service.ts';
 import { deliveryVersionInputSchema } from '../contracts/versions.ts';
+import type { CollaborationResultsService } from '../services/collaboration-results-service.ts';
+import type { AssistantControlService } from '../services/assistant-controls.ts';
 interface Caller {
   connection: ProjectConnection;
   sessionId: string;
@@ -36,6 +38,24 @@ function page<T>(items: T[], offset: number) {
   return { entries, nextOffset: cursor < items.length ? cursor : null, total: items.length };
 }
 const chatSchema = z.union([
+  z
+    .object({
+      action: z.literal('complete'),
+      content: z.string().optional(),
+      evidencePaths: z.array(z.string().min(1)).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      action: z.literal('hangup'),
+      content: z.string().trim().min(1),
+      dependencies: z.array(z.uuid()).default([]),
+      requestIds: z.array(z.uuid()).default([]),
+      resumeCondition: z.string().trim().min(1).optional(),
+    })
+    .strict(),
+  z.object({ retryResultId: z.uuid() }).strict(),
+  z.object({ retryWaitId: z.uuid() }).strict(),
   deliveryVersionInputSchema
     .omit({ operationId: true })
     .extend({ action: z.literal('complete') })
@@ -50,6 +70,7 @@ const chatSchema = z.union([
       content: z.string().refine((text) => text.trim().length > 0),
       replyTo: z.uuid().optional(),
       references: z.array(fileReferenceSchema).optional(),
+      allowedChecklistIds: z.array(z.string().regex(/^C\d{3,}$/)).optional(),
     })
     .strict(),
 ]);
@@ -61,6 +82,8 @@ export function installCommunicationTools(
   communication: CommunicationService,
   controls?: ExecutionControlService,
   completions?: CompletionService,
+  collaborations?: CollaborationResultsService,
+  assistants?: AssistantControlService,
 ): void {
   const caller = (exec: Execution) => {
     if (exec.agent !== owner)
@@ -110,15 +133,25 @@ export function installCommunicationTools(
   );
   register(
     'mat_chat',
-    '普通私聊或重试原消息。原主执行完成本票时action=complete，填写summary执行简报、scope修改范围、evidencePaths和checklistItemIds，一次固定版本、待审、独审安排和等待；不填target。软停止挂起用action=hangup、controlId和content，说明保存内容、后台状态与恢复位置。',
+    '普通私聊填target和content。原主负责人授权当前辅助更新Checklist时，必须另外传结构化allowedChecklistIds参数；正文声称授权无效，省略不变、列表替换、[]撤回。辅助正式交回：complete只填action、可选content/evidencePaths；hangup只填action、content原因、dependencies或resumeCondition，不填target或controlId。主负责人普通等待也用hangup及dependencies，不填target/controlId。只有收到真实软停止控制要求时，hangup才填该controlId。原主执行整票完成时complete须填summary、scope、evidencePaths、checklistItemIds，不填target，交回后进入整票独审。',
     {
-      action: { type: 'string', description: '完成交回complete；软停止回报hangup；普通聊天省略' },
+      action: {
+        type: 'string',
+        description:
+          '正式完成complete；普通等待或软停止回报hangup；普通聊天省略。正式交回均不填target；研究主执行完成必须填summary/scope/reportPaths，报告先写自己本次材料域',
+      },
       summary: { type: 'string', description: '完成交回的执行简报，保留必要失败和未完成项' },
       scope: { type: 'string', description: '本次实际修改与验证范围' },
       evidencePaths: {
         type: 'array',
         items: { type: 'string' },
         description: '交付证据入口，固定版本材料实际另验',
+      },
+      reportPaths: {
+        type: 'array',
+        items: { type: 'string' },
+        description:
+          '研究主执行整票完成必须关联自己本次材料域中的报告文件绝对路径。辅助仅用evidencePaths交回，不填reportPaths。',
       },
       checklistItemIds: {
         type: 'array',
@@ -127,6 +160,12 @@ export function installCommunicationTools(
       },
       controlId: { type: 'string', description: '软停止要求中的准确控制ID' },
       target: { type: 'string', description: '通讯录或创建工具返回的完整会话地址，或有资格的user' },
+      allowedChecklistIds: {
+        type: 'array',
+        items: { type: 'string' },
+        description:
+          '原主负责人对本次辅助指定允许更新的Checklist项；省略不变、列表替换、空列表撤回；不含人工项',
+      },
       content: { type: 'string', description: '工作正文，Markdown原样保存' },
       replyTo: { type: 'string', description: '同一私聊内原消息ID' },
       references: {
@@ -145,6 +184,30 @@ export function installCommunicationTools(
         description: '准确项目文件引用，不扩大可读范围',
       },
       retryMessageId: { type: 'string', description: '只重试自己原消息；填写时不填写其他参数' },
+      dependencies: {
+        type: 'array',
+        items: { type: 'string' },
+        description:
+          '普通挂起等待的当前collaborationId列表；不是会话ID。无对象时提供resumeCondition。',
+      },
+      requestIds: {
+        type: 'array',
+        items: { type: 'string' },
+        description:
+          '主执行普通挂起时等待本次自己提出的准确决定请求ID；不清除其他协作依赖。辅助保存请求后结束本轮，不另建Goal等待。',
+      },
+      resumeCondition: {
+        type: 'string',
+        description: '无已有对象时的明确恢复条件，不由软件猜测满足',
+      },
+      retryResultId: {
+        type: 'string',
+        description: '原辅助或主负责人补核已有正式结果和投递，不重做工作、不创建替代辅助',
+      },
+      retryWaitId: {
+        type: 'string',
+        description: '原主负责人或主管补核原等待的Goal暂停及接续；不创建替代Goal',
+      },
     },
     async (args, exec) => {
       const source = caller(exec),
@@ -152,6 +215,74 @@ export function installCommunicationTools(
         actor = { kind: 'session' as const, sessionId: source.sessionId },
         input = chatSchema.parse(args);
       if ('action' in input) {
+        if (
+          (input.action === 'complete' &&
+            source.connection.collaborations().currentForSession(source.sessionId)) ||
+          (input.action === 'hangup' && !('controlId' in input))
+        ) {
+          if (!collaborations)
+            throw new ProjectError('COLLABORATION_UNAVAILABLE', '正式协作回传与等待尚未装配');
+          const call = owner.session
+            .snapshotEvents()
+            .findLast(
+              (e) =>
+                e.type === 'tool/call' &&
+                e.data.name === 'mat_chat' &&
+                e.data.callId === exec.callId,
+            );
+          if (!call)
+            throw new ProjectError('TOOL_CALL_ID_REQUIRED', '正式交回或等待缺少实际工具事件');
+          const operationId = messageIdentity(
+            'mat-collaboration-chat:' + owner.id + ':' + call.seq + ':' + exec.callId,
+          );
+          const assistant = source.connection.collaborations().currentForSession(source.sessionId);
+          if (assistant) {
+            if ('requestIds' in input && input.requestIds.length)
+              throw new ProjectError(
+                'ASSISTANT_REQUEST_WAIT',
+                '辅助不创建Goal等待；保存请求后结束本轮，原答复沿关联接续',
+              );
+            const body = {
+              operationId,
+              action: input.action,
+              content:
+                'content' in input
+                  ? (input.content ?? '')
+                  : 'summary' in input
+                    ? input.summary
+                    : '',
+              evidencePaths: 'evidencePaths' in input ? (input.evidencePaths ?? []) : [],
+              ...('dependencies' in input ? { dependencies: input.dependencies } : {}),
+              ...('resumeCondition' in input && input.resumeCondition
+                ? { resumeCondition: input.resumeCondition }
+                : {}),
+            };
+            const saved = collaborations.report(projectId, source.sessionId, owner, body);
+            return encode({
+              resultId: saved.id,
+              collaborationId: saved.collaborationId,
+              progress: saved.progress,
+              note: '正式结果已保存；停稳、投递与主负责人整合分别核对，不冒充整票通过',
+            });
+          }
+          if (input.action !== 'hangup')
+            throw new ProjectError('CURRENT_ASSISTANT_REQUIRED', '没有当前协作责任');
+          const saved = await collaborations.wait(projectId, source.sessionId, owner, {
+            operationId,
+            reason: input.content,
+            dependencies: 'dependencies' in input ? input.dependencies : [],
+            requestIds: 'requestIds' in input ? input.requestIds : [],
+            ...('resumeCondition' in input && input.resumeCondition
+              ? { resumeCondition: input.resumeCondition }
+              : {}),
+          });
+          return encode({
+            waitId: saved.id,
+            state: saved.state,
+            dependencies: saved.dependencies,
+            error: saved.error,
+          });
+        }
         if (input.action === 'complete') {
           if (!completions)
             throw new ProjectError('COMPLETION_UNAVAILABLE', '完成交回服务尚未接入');
@@ -183,11 +314,48 @@ export function installCommunicationTools(
           });
         }
         if (!controls) throw new ProjectError('CONTROL_UNAVAILABLE', '执行控制尚未接入');
+        if (!('controlId' in input))
+          throw new ProjectError('CONTROL_ID_REQUIRED', '上级软停止回报需准确controlId');
+        if (
+          source.connection
+            .assistantControls()
+            .list()
+            .some((v) => v.id === input.controlId)
+        ) {
+          if (!assistants)
+            throw new ProjectError('ASSISTANT_CONTROL_UNAVAILABLE', '辅助控制服务尚未装配');
+          return encode(
+            await assistants.handoff(
+              projectId,
+              source.sessionId,
+              owner,
+              input.controlId,
+              input.content,
+            ),
+          );
+        }
         return encode(
           await controls.handoff(projectId, source.sessionId, input.controlId, input.content),
         );
       }
       let saved;
+      if ('retryWaitId' in input) {
+        if (!collaborations)
+          throw new ProjectError('COLLABORATION_UNAVAILABLE', '协作等待服务尚未装配');
+        return encode(
+          await collaborations.retryWait(projectId, source.sessionId, owner, input.retryWaitId),
+        );
+      }
+      if ('retryResultId' in input) {
+        if (!collaborations)
+          throw new ProjectError('COLLABORATION_UNAVAILABLE', '协作回传服务尚未装配');
+        const v = collaborations.retry(projectId, source.sessionId, owner, input.retryResultId);
+        return encode({
+          resultId: v.id,
+          progress: v.progress,
+          note: '沿原结果补核，不创建替代执行',
+        });
+      }
       if ('retryMessageId' in input)
         saved = await communication.retry(projectId, actor, input.retryMessageId);
       else {

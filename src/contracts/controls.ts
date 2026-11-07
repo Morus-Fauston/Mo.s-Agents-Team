@@ -10,6 +10,10 @@ export const controlBodySchema = z
     content: z.string().max(48000).default(''),
     expectedRevision: z.number().int().nonnegative(),
     stopMode: z.enum(['soft', 'hard']).default('hard'),
+    reviewedRecoveryFingerprint: z
+      .string()
+      .regex(/^[0-9a-f]{64}$/)
+      .optional(),
   })
   .strict();
 export const controlInputSchema = controlBodySchema.extend({ operationId: z.uuid() });
@@ -20,6 +24,35 @@ export const receiptSchema = z.object({
   goalId: z.string().optional(),
 });
 export type ControlReceipt = z.infer<typeof receiptSchema>;
+const recoveryFileSchema = z.object({ path: z.string(), sha256: z.string().nullable() });
+export const recoveryCheckpointSchema = z.object({
+  files: z.array(recoveryFileSchema),
+  norms: z.array(recoveryFileSchema),
+  requirements: z.string(),
+  writeScopes: z.array(z.string()),
+  cwd: z.string(),
+  dependencyVersionIds: z.array(z.string()),
+});
+export type RecoveryCheckpoint = z.infer<typeof recoveryCheckpointSchema>;
+export const recoveryPreviewSchema = z.object({
+  executionId: z.uuid(),
+  expectedRevision: z.number().int().nonnegative(),
+  stoppedControlId: z.uuid(),
+  fingerprint: z.string(),
+  hasChanges: z.boolean(),
+  baselineMissing: z.boolean(),
+  requirementsChanged: z.boolean(),
+  scopeChanged: z.boolean(),
+  dependencyChanged: z.boolean(),
+  fileCount: z.number().int().nonnegative(),
+  files: z.array(
+    z.object({ path: z.string(), before: z.string().nullable(), after: z.string().nullable() }),
+  ),
+  norms: z.array(
+    z.object({ path: z.string(), before: z.string().nullable(), after: z.string().nullable() }),
+  ),
+});
+export type RecoveryPreview = z.infer<typeof recoveryPreviewSchema>;
 export const stoppedObservationSchema = z.object({
   agentIdle: z.boolean().nullable(),
   inFlightTools: z.boolean().nullable(),
@@ -36,6 +69,7 @@ export const stoppedObservationSchema = z.object({
   note: z.string(),
   observedAt: z.string().optional(),
   intervalMs: z.number().nonnegative().optional(),
+  checkpoint: recoveryCheckpointSchema.optional(),
 });
 export type StoppedObservation = z.infer<typeof stoppedObservationSchema>;
 export const controlSchema = z.object({
@@ -48,6 +82,7 @@ export const controlSchema = z.object({
   content: z.string(),
   stopMode: z.enum(['soft', 'hard']),
   revision: z.number().int().positive(),
+  assistantTargetIds: z.array(z.uuid()).default([]),
   status: z.enum([
     'requested',
     'delivered',
@@ -74,6 +109,7 @@ export const controlSchema = z.object({
   messageId: z.uuid(),
   resumeMessageId: z.uuid(),
   resumeSnapshot: z.unknown().nullable(),
+  reviewedRecoveryFingerprint: z.string().nullable().default(null),
   epoch: z.string(),
   createdAt: z.string(),
   updatedAt: z.string(),

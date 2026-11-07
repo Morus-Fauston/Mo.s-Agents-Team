@@ -6,6 +6,7 @@ import { ProjectService } from '../services/project-service.ts';
 import { createApplication } from './application.ts';
 import type { SessionRuntime } from '../host/session-runtime.ts';
 export interface ConsoleConfiguration {
+  projectRoot: string;
   stateDirectory: string;
   port: number;
   assetsDirectory?: string;
@@ -29,7 +30,8 @@ export async function startConsole(config: ConsoleConfiguration): Promise<Consol
   if (!Number.isInteger(config.port) || config.port < 0 || config.port > 65535)
     throw new RangeError('控制台端口必须在0到65535之间');
   if (!isAbsolute(config.stateDirectory)) throw new Error('插件存储必须是绝对目录');
-  const service = new ProjectService(config.stateDirectory);
+  if (!config.projectRoot) throw new Error('必须显式配置 projectRoot，不能从旧项目列表选择');
+  const service = new ProjectService(config.stateDirectory, config.projectRoot);
   let server: ReturnType<typeof serve> | undefined;
   let runtime: SessionRuntime | undefined;
   const shutdown = new AbortController();

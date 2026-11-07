@@ -1,6 +1,12 @@
-import { useState } from 'react';
+import { WorktreeDirectory } from './worktree-details';
+import { LocalCommitDetail } from './local-commits';
+import { WorktreeMergeDetail } from './worktree-merges';
+import { useLayoutEffect, useRef, useState } from 'react';
+import { Dialog } from 'radix-ui';
+import { useLocation, useNavigate, useSearchParams } from 'react-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { z } from 'zod';
+import ReactMarkdown from 'react-markdown';
 import type { ProjectView } from '../src/contracts/project';
 import {
   phaseSchema,
@@ -9,6 +15,7 @@ import {
   supervisorTaskSchema,
   feedbackSchema,
   historyEntrySchema,
+  planSchema,
 } from '../src/contracts/workbench';
 import type { PhaseRecord } from '../src/contracts/workbench';
 import { request } from './request';
@@ -22,12 +29,18 @@ import {
 } from './workbench-form';
 import type { WorkbenchCommand } from './workbench-form';
 import { TicketDetails } from './ticket-details';
+import type { TicketDetailSection } from './ticket-details';
+import { DecisionRequests } from './decision-requests';
+import { HistoryTargets } from './history-targets';
+import type { HistoryTarget } from './history-targets';
 import { stateLabels, historyLabels } from './ticket-state';
 import styles from './workbench.module.css';
+import shell from './workspace-shell.module.css';
 export const ticketBriefSchema = ticketSchema.pick({
   id: true,
   code: true,
   title: true,
+  kind: true,
   goal: true,
   state: true,
   phaseId: true,
@@ -42,6 +55,7 @@ export const workbenchSnapshotSchema = z.object({
   tasks: z.array(supervisorTaskSchema),
   feedback: z.array(feedbackSchema),
   history: z.array(historyEntrySchema),
+  plans: z.array(planSchema).default([]),
 });
 export type WorkbenchSnapshot = z.infer<typeof workbenchSnapshotSchema>;
 const phaseLabels = {
@@ -331,6 +345,8 @@ function NewTicket({
           await run(base + '/tickets', {
             phaseId: text(form, 'phaseId'),
             categoryId: text(form, 'categoryId'),
+            kind: text(form, 'kind'),
+            researchBody: text(form, 'researchBody'),
             title: text(form, 'title'),
             goal: text(form, 'goal'),
             included: text(form, 'included'),
@@ -361,6 +377,17 @@ function NewTicket({
             </option>
           ))}
         </select>
+      </label>
+      <label>
+        票据类型
+        <select name="kind" aria-label="票据类型" defaultValue="development">
+          <option value="development">开发交付</option>
+          <option value="research">研究调查</option>
+        </select>
+      </label>
+      <label>
+        研究正文（研究票使用）
+        <textarea name="researchBody" aria-label="研究正文" maxLength={128000} />
       </label>
       <label>
         类别
@@ -512,52 +539,61 @@ function SupervisorTasks({
               .map((id) => data.tickets.find((ticket) => ticket.id === id)?.code ?? id)
               .join('、') || '无票据关联'}
           </p>
-          <WorkbenchForm
-            title="维护主管清单"
-            trigger={`维护 ${task.title}`}
-            onSubmit={(form) =>
-              run(
-                base + `/supervisor-tasks/${task.id}`,
-                {
-                  expectedRevision: task.revision,
-                  title: text(form, 'title'),
-                  state: text(form, 'state'),
-                  basis: text(form, 'basis'),
-                  reason: text(form, 'reason'),
-                },
-                'PATCH',
-              )
-            }
-          >
-            <label>
-              标题
-              <input aria-label="标题" name="title" defaultValue={task.title} required />
-            </label>
-            <label>
-              状态
-              <select aria-label="状态" name="state" defaultValue={task.state}>
-                <option value="unchecked">未完成</option>
-                <option value="held">挂起等待</option>
-                <option value="checked">有依据完成</option>
-              </select>
-            </label>
-            <label>
-              完成或等待依据
-              <textarea
-                aria-label="完成或等待依据"
-                name="basis"
-                defaultValue={task.basis}
-                required
-              />
-            </label>
-            <label>
-              修改理由
-              <input aria-label="修改理由" name="reason" required />
-            </label>
-          </WorkbenchForm>
+          {task.business?.kind === 'local-commit' && (
+            <LocalCommitDetail base={base} id={task.business.id} />
+          )}
+          {task.business?.kind === 'worktree-merge' && (
+            <WorktreeMergeDetail base={base} id={task.business.id} />
+          )}
+          {!task.business && (
+            <WorkbenchForm
+              title="维护主管清单"
+              trigger={`维护 ${task.title}`}
+              onSubmit={(form) =>
+                run(
+                  base + `/supervisor-tasks/${task.id}`,
+                  {
+                    expectedRevision: task.revision,
+                    title: text(form, 'title'),
+                    state: text(form, 'state'),
+                    basis: text(form, 'basis'),
+                    reason: text(form, 'reason'),
+                  },
+                  'PATCH',
+                )
+              }
+            >
+              <label>
+                标题
+                <input aria-label="标题" name="title" defaultValue={task.title} required />
+              </label>
+              <label>
+                状态
+                <select aria-label="状态" name="state" defaultValue={task.state}>
+                  <option value="unchecked">未完成</option>
+                  <option value="held">挂起等待</option>
+                  <option value="checked">有依据完成</option>
+                </select>
+              </label>
+              <label>
+                完成或等待依据
+                <textarea
+                  aria-label="完成或等待依据"
+                  name="basis"
+                  defaultValue={task.basis}
+                  required
+                />
+              </label>
+              <label>
+                修改理由
+                <input aria-label="修改理由" name="reason" required />
+              </label>
+            </WorkbenchForm>
+          )}
           <SupervisorTaskHistory base={base} id={task.id} />
         </article>
       ))}
+      <WorktreeDirectory base={base} />
     </section>
   );
 }
@@ -605,14 +641,85 @@ function SupervisorTaskHistory({ base, id }: { base: string; id: string }) {
     </section>
   );
 }
+const ticketSections = z.enum([
+  'requirements',
+  'checklist',
+  'logs',
+  'materials',
+  'revisions',
+  'execution',
+  'acceptance',
+  'relationships',
+  'research',
+]);
+const workPanels = z.enum(['tasks', 'requests', 'feedback']);
+const trailSchema = z.array(
+  z.object({ id: z.uuid(), section: ticketSections, recordId: z.string().nullable() }),
+);
+type TicketTrail = z.infer<typeof trailSchema>;
 export function TicketWorkbench({ project }: { project: ProjectView }) {
   const base = `/api/projects/${project.id}`,
     run = useWorkbenchCommand(project.id),
     client = useQueryClient(),
     updates = useProjectUpdates(project.id);
-  const [view, setView] = useState<'tickets' | 'tasks' | 'history' | 'feedback'>('tickets'),
-    [phaseId, setPhaseId] = useState(''),
-    [selectedTicket, setSelectedTicket] = useState<string | null>(null);
+  const [params, setParams] = useSearchParams(),
+    location = useLocation(),
+    navigate = useNavigate();
+  const panel = workPanels.safeParse(params.get('panel')),
+    parsedSection = ticketSections.safeParse(params.get('section')),
+    view = params.get('view') === 'history' ? 'history' : panel.success ? panel.data : 'tickets',
+    ticketId = params.get('ticket'),
+    selectedTicket = ticketId
+      ? {
+          id: ticketId,
+          section: parsedSection.success ? parsedSection.data : ('requirements' as const),
+          recordId: params.get('record'),
+        }
+      : null,
+    trail = trailSchema.safeParse(location.state?.ticketTrail),
+    ticketTrail = trail.success ? trail.data : [];
+  const patchLocation = (
+    fields: Record<string, string | null>,
+    options: { replace?: boolean; trail?: TicketTrail } = {},
+  ) => {
+    const next = new URLSearchParams(params);
+    for (const [key, value] of Object.entries(fields)) {
+      if (value === null) next.delete(key);
+      else next.set(key, value);
+    }
+    setParams(next, {
+      replace: options.replace ?? false,
+      state: { ticketTrail: options.trail ?? [] },
+      preventScrollReset: true,
+    });
+  };
+  const setView = (next: 'tickets' | 'tasks' | 'history' | 'feedback' | 'requests') =>
+    patchLocation({
+      view: next === 'history' ? 'history' : 'tickets',
+      panel: next === 'history' || next === 'tickets' ? null : next,
+      ticket: null,
+      section: null,
+      record: null,
+      request: null,
+      historyEntry: null,
+    });
+  const [layout, setLayout] = useState<'board' | 'table'>('board'),
+    returnFocus = useRef<HTMLElement | null>(null),
+    drawer = useRef<HTMLDivElement | null>(null);
+  useLayoutEffect(() => {
+    if (drawer.current) drawer.current.scrollTop = 0;
+  }, [selectedTicket?.id]);
+  const setSelectedTicket = (id: string | null) => {
+    if (id) {
+      returnFocus.current =
+        document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      patchLocation({ ticket: id, section: null, record: null });
+    } else
+      patchLocation(
+        { phase: phase?.id ?? params.get('phase'), ticket: null, section: null, record: null },
+        { replace: true },
+      );
+  };
   const query = useQuery({
     queryKey: ['workbench', project.id],
     queryFn: async () => workbenchSnapshotSchema.parse(await request(base + '/workbench')),
@@ -625,8 +732,68 @@ export function TicketWorkbench({ project }: { project: ProjectView }) {
       </p>
     );
   const data = query.data,
-    phase = data.phases.find((item) => item.id === phaseId) ?? data.phases[0],
+    phase =
+      data.phases.find((item) => item.id === params.get('phase')) ??
+      data.phases.find(
+        (item) => item.id === data.tickets.find((ticket) => ticket.id === ticketId)?.phaseId,
+      ) ??
+      data.phases[0],
     tickets = data.tickets.filter((ticket) => ticket.phaseId === phase?.id);
+  const focusedHistory = params.get('historyEntry'),
+    history = focusedHistory
+      ? data.history.filter((entry) => entry.id === focusedHistory)
+      : data.history;
+  const openHistoryTarget = (target: HistoryTarget) => {
+    if (target.kind === 'phase') {
+      patchLocation({
+        view: 'tickets',
+        panel: null,
+        phase: target.recordId,
+        ticket: null,
+        section: null,
+        record: null,
+        request: null,
+        historyEntry: null,
+      });
+      return;
+    }
+    if (target.kind === 'history') {
+      patchLocation({ historyEntry: target.recordId });
+      return;
+    }
+    if (target.kind === 'decision') {
+      patchLocation({
+        view: 'tickets',
+        panel: 'requests',
+        request: target.recordId,
+        historyEntry: null,
+        ticket: null,
+        section: null,
+        record: null,
+      });
+      return;
+    }
+    if (target.ticketId) {
+      const original = data.tickets.find((row) => row.id === target.ticketId);
+      patchLocation({
+        view: 'tickets',
+        panel: null,
+        phase: original?.phaseId ?? null,
+        ticket: target.ticketId,
+        section:
+          target.kind === 'log'
+            ? 'logs'
+            : target.kind === 'delivery'
+              ? 'materials'
+              : target.kind === 'acceptance'
+                ? 'acceptance'
+                : null,
+        record: ['log', 'delivery', 'acceptance'].includes(target.kind) ? target.recordId : null,
+        request: null,
+        historyEntry: null,
+      });
+    }
+  };
   return (
     <section>
       <div className={styles.sectionHeader}>
@@ -649,6 +816,7 @@ export function TicketWorkbench({ project }: { project: ProjectView }) {
           [
             ['tickets', '期次与票据'],
             ['tasks', '主管清单'],
+            ['requests', '决定请求'],
             ['history', '项目历史'],
             ['feedback', '测试期意见'],
           ] as const
@@ -667,6 +835,54 @@ export function TicketWorkbench({ project }: { project: ProjectView }) {
       {view === 'tickets' && (
         <>
           <PhaseForms base={base} phase={phase} phases={data.phases} run={run} />
+          <section aria-label="主管规划">
+            <h4>主管规划</h4>
+            {data.plans.length === 0 && (
+              <p>主管保存规划后，在这里核对目标与范围并确认，再由主管拆票。</p>
+            )}
+            {data.plans.map((plan) => (
+              <details key={plan.id}>
+                <summary>
+                  {plan.goal} · {plan.confirmation ? '已确认' : '待确认'}
+                </summary>
+                <p>
+                  期次：{data.phases.find((item) => item.id === plan.phaseId)?.code} · 来源：
+                  {plan.author.address ?? '用户'}
+                </p>
+                <p>包含：{plan.included}</p>
+                <p>不包含：{plan.excluded || '未另列'}</p>
+                <p>依据：{plan.basis}</p>
+                <div className={styles.markdown}>
+                  <ReactMarkdown>{plan.content}</ReactMarkdown>
+                </div>
+                {plan.confirmation ? (
+                  <p>
+                    用户确认：{plan.confirmation.reason} · {plan.confirmation.at}
+                  </p>
+                ) : (
+                  <WorkbenchForm
+                    title="确认规划范围"
+                    trigger="确认规划"
+                    description="确认主管可在此规划范围内正式拆票。开放期次和派工仍分别办理。"
+                    onSubmit={(form) =>
+                      run(base + `/plans/${plan.id}/confirm`, {
+                        expectedRevision: plan.revision,
+                        reason: text(form, 'reason'),
+                      })
+                    }
+                  >
+                    <p>{plan.goal}</p>
+                    <p>包含：{plan.included}</p>
+                    <p>不包含：{plan.excluded || '未另列'}</p>
+                    <label>
+                      确认依据
+                      <textarea name="reason" required />
+                    </label>
+                  </WorkbenchForm>
+                )}
+              </details>
+            ))}
+          </section>
           {data.phases.length === 0 ? (
             <p className={styles.description}>
               先建立未开放期次，再定义本项目类别。系统不预设票据类别。
@@ -678,10 +894,14 @@ export function TicketWorkbench({ project }: { project: ProjectView }) {
                 <select
                   aria-label="查看期次"
                   value={phase?.id ?? ''}
-                  onChange={(event) => {
-                    setPhaseId(event.target.value);
-                    setSelectedTicket(null);
-                  }}
+                  onChange={(event) =>
+                    patchLocation({
+                      phase: event.target.value,
+                      ticket: null,
+                      section: null,
+                      record: null,
+                    })
+                  }
                 >
                   {data.phases.map((item) => (
                     <option key={item.id} value={item.id}>
@@ -717,59 +937,197 @@ export function TicketWorkbench({ project }: { project: ProjectView }) {
                   {phase.state === 'unopened' && (
                     <p className={styles.description}>本期未开放。可维护计划；不能派工。</p>
                   )}
-                  <div className={styles.tableWrap}>
-                    <table className={styles.ticketTable}>
-                      <thead>
-                        <tr>
-                          <th>编号与名称</th>
-                          <th>状态</th>
-                          <th>直接依赖</th>
-                          <th>执行</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {tickets.map((ticket) => (
-                          <tr key={ticket.id}>
-                            <td>
+                  <div className={styles.tabs} aria-label="本期票据布局">
+                    <button
+                      type="button"
+                      aria-pressed={layout === 'board'}
+                      onClick={() => setLayout('board')}
+                    >
+                      看板
+                    </button>
+                    <button
+                      type="button"
+                      aria-pressed={layout === 'table'}
+                      onClick={() => setLayout('table')}
+                    >
+                      列表
+                    </button>
+                  </div>
+                  {phase.state === 'unopened' && (
+                    <p className={styles.description}>后续计划 · 本期尚未开放执行。</p>
+                  )}
+                  {layout === 'board' ? (
+                    <div
+                      className={shell.board}
+                      aria-label="本期票据看板"
+                      role="region"
+                      tabIndex={0}
+                    >
+                      {(Object.keys(stateLabels) as (keyof typeof stateLabels)[]).map((state) => {
+                        const column = tickets.filter((ticket) => ticket.state === state);
+                        return (
+                          <section
+                            key={state}
+                            className={shell.boardColumn}
+                            aria-label={stateLabels[state]}
+                          >
+                            <h5>
+                              {stateLabels[state]} <span>{column.length}</span>
+                            </h5>
+                            {column.map((ticket) => (
                               <button
+                                key={ticket.id}
+                                className={shell.boardTicket}
                                 type="button"
-                                className={styles.textButton}
                                 onClick={() => setSelectedTicket(ticket.id)}
                               >
-                                {ticket.code} · {ticket.title}
+                                <small>{ticket.code}</small>
+                                <strong>{ticket.title}</strong>
+                                {!!ticket.dependencies.length && (
+                                  <span>前置 {ticket.dependencies.length} 项</span>
+                                )}
                               </button>
-                            </td>
-                            <td>{stateLabels[ticket.state]}</td>
-                            <td>
-                              {ticket.dependencies
-                                .map(
-                                  (id) => data.tickets.find((item) => item.id === id)?.code ?? id,
-                                )
-                                .join('、') || '无'}
-                            </td>
-                            <td>{ticket.currentExecution ?? '尚未派工'}</td>
+                            ))}
+                            {!column.length && <p>暂无票据</p>}
+                          </section>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <div className={styles.tableWrap}>
+                      <table className={styles.ticketTable}>
+                        <thead>
+                          <tr>
+                            <th>编号与名称</th>
+                            <th>状态</th>
+                            <th>直接依赖</th>
+                            <th>执行</th>
                           </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
+                        </thead>
+                        <tbody>
+                          {tickets.map((ticket) => (
+                            <tr key={ticket.id}>
+                              <td>
+                                <button
+                                  type="button"
+                                  className={styles.textButton}
+                                  onClick={() => setSelectedTicket(ticket.id)}
+                                >
+                                  {ticket.code} · {ticket.title}
+                                </button>
+                              </td>
+                              <td>{stateLabels[ticket.state]}</td>
+                              <td>
+                                {ticket.dependencies
+                                  .map(
+                                    (id) => data.tickets.find((item) => item.id === id)?.code ?? id,
+                                  )
+                                  .join('、') || '无'}
+                              </td>
+                              <td>{ticket.currentExecution ?? '尚未派工'}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
                   {tickets.length === 0 && <p>本期暂无票据。</p>}
                 </>
               )}
-              {selectedTicket && (
-                <TicketDetails
-                  key={selectedTicket}
-                  projectId={project.id}
-                  ticketId={selectedTicket}
-                  data={data}
-                  run={run}
-                />
-              )}
+              <Dialog.Root
+                open={!!selectedTicket}
+                onOpenChange={(open) => {
+                  if (!open) setSelectedTicket(null);
+                }}
+              >
+                <Dialog.Portal>
+                  <Dialog.Overlay className={styles.overlay} />
+                  <Dialog.Content
+                    ref={drawer}
+                    className={shell.ticketDrawer}
+                    onCloseAutoFocus={(event) => {
+                      const target = returnFocus.current?.isConnected
+                        ? returnFocus.current
+                        : document.getElementById('main-content');
+                      if (target) {
+                        event.preventDefault();
+                        target.focus({ preventScroll: true });
+                      }
+                    }}
+                  >
+                    <div className={shell.drawerHeader}>
+                      <Dialog.Title>票据详情</Dialog.Title>
+                      <Dialog.Description className={shell.srOnly}>
+                        查看当前票据、执行和成果。关闭后返回原列表。
+                      </Dialog.Description>
+                      <div className={styles.actions}>
+                        {ticketTrail.length > 0 && (
+                          <button
+                            type="button"
+                            className={styles.button}
+                            onClick={() => void navigate(-1)}
+                          >
+                            返回上一张票
+                          </button>
+                        )}
+                        <Dialog.Close type="button" className={styles.button}>
+                          关闭详情
+                        </Dialog.Close>
+                      </div>
+                    </div>
+                    {selectedTicket && (
+                      <TicketDetails
+                        key={selectedTicket.id}
+                        projectId={project.id}
+                        ticketId={selectedTicket.id}
+                        data={data}
+                        run={run}
+                        section={selectedTicket.section}
+                        recordId={selectedTicket.recordId}
+                        onOpenTicket={(id, section, record) =>
+                          patchLocation(
+                            {
+                              ticket: id,
+                              section: section ?? null,
+                              record: record ?? null,
+                              phase: phase?.id ?? null,
+                            },
+                            { trail: [...ticketTrail, selectedTicket] },
+                          )
+                        }
+                        onSectionChange={(section: TicketDetailSection, recordId) =>
+                          patchLocation(
+                            { section, record: recordId ?? null },
+                            { replace: !recordId, trail: ticketTrail },
+                          )
+                        }
+                        onOpenDecision={(id) =>
+                          patchLocation({
+                            view: 'tickets',
+                            panel: 'requests',
+                            request: id,
+                            ticket: null,
+                            section: null,
+                            record: null,
+                          })
+                        }
+                      />
+                    )}
+                  </Dialog.Content>
+                </Dialog.Portal>
+              </Dialog.Root>
             </>
           )}
         </>
       )}
       {view === 'tasks' && <SupervisorTasks data={data} base={base} run={run} />}
+      {view === 'requests' && (
+        <DecisionRequests
+          key={params.get('request') ?? 'list'}
+          projectId={project.id}
+          initialRequestId={params.get('request')}
+        />
+      )}
       {view === 'history' && (
         <section>
           <div className={styles.sectionHeader}>
@@ -800,7 +1158,17 @@ export function TicketWorkbench({ project }: { project: ProjectView }) {
             </WorkbenchForm>
           </div>
           <p className={styles.description}>事件保留发生时的含义；当前票据状态以原记录为准。</p>
-          {data.history.map((entry) => (
+          {focusedHistory && (
+            <button
+              type="button"
+              className={styles.button}
+              onClick={() => patchLocation({ historyEntry: null })}
+            >
+              返回完整历史
+            </button>
+          )}
+          {focusedHistory && !history.length && <p role="alert">找不到引用的原历史记录。</p>}
+          {history.map((entry) => (
             <article className={styles.recordRow} key={entry.id}>
               <p>
                 {new Date(entry.at).toLocaleString()} · {historyLabels[entry.kind] ?? '业务记录'} ·{' '}
@@ -817,14 +1185,26 @@ export function TicketWorkbench({ project }: { project: ProjectView }) {
                   className={styles.textButton}
                   onClick={() => {
                     const ticket = data.tickets.find((ticket) => ticket.id === entry.objectId)!;
-                    setPhaseId(ticket.phaseId);
-                    setSelectedTicket(ticket.id);
-                    setView('tickets');
+                    patchLocation({
+                      view: 'tickets',
+                      panel: null,
+                      phase: ticket.phaseId,
+                      ticket: ticket.id,
+                      section: null,
+                      record: null,
+                      request: null,
+                      historyEntry: null,
+                    });
                   }}
                 >
                   查看原票
                 </button>
               )}
+              <HistoryTargets
+                projectId={project.id}
+                entryId={entry.id}
+                openTarget={openHistoryTarget}
+              />
             </article>
           ))}
         </section>

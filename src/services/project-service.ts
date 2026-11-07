@@ -10,9 +10,20 @@ export class ProjectService {
   private readonly registry: string;
   private roots: string[];
   private closed = false;
-  constructor(stateDirectory: string) {
+  readonly projectRoot: string | undefined;
+  constructor(stateDirectory: string, projectRoot?: string) {
+    this.projectRoot = projectRoot === undefined ? undefined : resolveProjectRoot(projectRoot);
     mkdirSync(stateDirectory, { recursive: true });
     this.registry = join(stateDirectory, '项目目录.json');
+    if (this.projectRoot) {
+      this.roots = [];
+      try {
+        this.attach(this.projectRoot);
+      } catch (error) {
+        if (!(error instanceof ProjectError) || error.code !== 'NOT_INITIALIZED') throw error;
+      }
+      return;
+    }
     const saved: unknown = existsSync(this.registry)
       ? JSON.parse(readFileSync(this.registry, 'utf8'))
       : [];
@@ -62,15 +73,18 @@ export class ProjectService {
   attach(inputRoot: string): ProjectView {
     this.requireOpen();
     const root = resolveProjectRoot(inputRoot);
+    this.requireBoundRoot(root);
     const existing = this.connections.get(root);
     if (existing) return existing.snapshot();
     const connection = connectProject(root);
     try {
       this.requireUniqueIdentity(connection.snapshot());
       const next = [...new Set([...this.roots, root])];
-      const temporary = `${this.registry}.${randomUUID()}.tmp`;
-      writeFileSync(temporary, JSON.stringify(next, null, 2), { flag: 'wx', encoding: 'utf8' });
-      renameSync(temporary, this.registry);
+      if (!this.projectRoot) {
+        const temporary = `${this.registry}.${randomUUID()}.tmp`;
+        writeFileSync(temporary, JSON.stringify(next, null, 2), { flag: 'wx', encoding: 'utf8' });
+        renameSync(temporary, this.registry);
+      }
       this.roots = next;
       this.connections.set(root, connection);
       this.failures.delete(root);
@@ -82,8 +96,13 @@ export class ProjectService {
   }
   create(input: InitializeInput): ProjectView {
     this.requireOpen();
+    this.requireBoundRoot(resolveProjectRoot(input.root));
     initializeProject(input);
     return this.attach(input.root);
+  }
+  private requireBoundRoot(root: string): void {
+    if (this.projectRoot && root !== this.projectRoot)
+      throw new ProjectError('PROJECT_ROOT_MISMATCH', '只能操作启动时绑定的项目目录');
   }
   close(): void {
     if (!this.closed) {

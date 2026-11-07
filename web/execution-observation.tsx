@@ -1,3 +1,5 @@
+import { WorktreeDetails } from './worktree-details';
+import { WorktreeMergeDetail } from './worktree-merges';
 import { useQuery } from '@tanstack/react-query';
 import { useState } from 'react';
 import { ReviewSettings, ReviewProgress } from './review-progress';
@@ -13,6 +15,7 @@ const detailSchema = z.object({
   events: z.array(z.object({ kind: z.string(), at: z.string(), data: z.unknown() })),
   native: z.object({
     loaded: z.boolean(),
+    historical: z.boolean().default(false),
     status: z.string().nullable(),
     cwd: z.string().nullable(),
     selection: z.unknown(),
@@ -55,6 +58,8 @@ function ExecutionRecordObservation({
   return (
     <section aria-label="执行观察">
       <ExecutionControls projectId={projectId} executionId={executionId} />
+      {r.worktreeId && <WorktreeDetails base={`/api/projects/${projectId}`} id={r.worktreeId} />}
+      {r.mergeId && <WorktreeMergeDetail base={`/api/projects/${projectId}`} id={r.mergeId} />}
       <DeliveryDiff projectId={projectId} executionId={executionId} />
       <ReviewProgress projectId={projectId} executionId={executionId} />
       <h4>{stages[r.startupState]}</h4>
@@ -70,8 +75,21 @@ function ExecutionRecordObservation({
         <dt>会话</dt>
         <dd>
           {r.sessionId ?? '尚未取得'} ·{' '}
-          {native.loaded ? `已加载 · ${native.status}` : '未加载；查询不会唤醒'}
+          {native.historical
+            ? '历史尝试 · 仅显示本次记录'
+            : native.loaded
+              ? `已加载 · ${native.status}`
+              : '未加载；查询不会唤醒'}
         </dd>
+        {r.sessionReuse && (
+          <>
+            <dt>顺序承票</dt>
+            <dd>
+              同一会话，新派工与新 Goal。原执行 {r.sessionReuse.previousExecutionId}，原审阅结果{' '}
+              {r.sessionReuse.previousResultId}。
+            </dd>
+          </>
+        )}
         <dt>写入占用</dt>
         <dd>
           {r.writeOccupancy} · {r.lifecycleState}
@@ -93,6 +111,25 @@ function ExecutionRecordObservation({
           · {native.goal ? '当前宿主读取' : '最后持久快照'}
         </dd>
       </dl>
+      {!!r.scopeAdjustments.length && (
+        <details>
+          <summary>写域调整 · {r.scopeAdjustments.length} 次</summary>
+          {r.scopeAdjustments.map((item) => (
+            <article key={item.operationId} className={styles.recordRow}>
+              <h5>
+                写域修订 {item.revision} · 控制修订 {item.controlRevision}
+              </h5>
+              <p>{item.reason}</p>
+              <p>原写域：{item.before.join('、') || '只读'}</p>
+              <p>新写域：{item.after.join('、') || '只读'}</p>
+              <p>
+                停稳记录：{item.stoppedControlId}
+                {item.decisionRequestId ? ` · 决定 ${item.decisionRequestId}` : ''}
+              </p>
+            </article>
+          ))}
+        </details>
+      )}
       {r.failure && (
         <p role="alert">
           {r.failure.message} · {r.failure.code}。保留原执行核对，不自动重派。

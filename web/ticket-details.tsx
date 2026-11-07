@@ -18,6 +18,10 @@ import type { WorkbenchCommand } from './workbench-form';
 import { request } from './request';
 import { ExecutionObservation } from './execution-observation';
 import { TicketAcceptance } from './ticket-acceptance';
+import { ResearchDetails } from './research';
+import { TicketDeliveryPanel, MaterialPreview, liveMaterialPreview } from './ticket-delivery';
+import { TicketRelatedRecords } from './ticket-relationships';
+import { ticketDeliverySchema } from '../src/contracts/ticket-deliveries';
 import styles from './workbench.module.css';
 function Markdown({ content }: { content: string }) {
   return (
@@ -71,6 +75,7 @@ function EditTicket({
             phaseId: text(form, 'phaseId'),
             categoryId: text(form, 'categoryId'),
             dependencies: form.getAll('dependencies').map(String),
+            ...(ticket.kind === 'research' ? { researchBody: text(form, 'researchBody') } : {}),
           },
           'PATCH',
         )
@@ -92,6 +97,17 @@ function EditTicket({
         不包含
         <textarea aria-label="不包含" name="excluded" defaultValue={ticket.excluded} />
       </label>
+      {ticket.kind === 'research' && (
+        <label>
+          研究正文
+          <textarea
+            name="researchBody"
+            aria-label="研究正文"
+            defaultValue={ticket.research?.body ?? ''}
+            maxLength={128000}
+          />
+        </label>
+      )}
       <label>
         当前归属期次
         <select aria-label="当前归属期次" name="phaseId" defaultValue={ticket.phaseId}>
@@ -221,10 +237,12 @@ function Checklist({
   ticket,
   base,
   run,
+  openLog,
 }: {
   ticket: TicketRecord;
   base: string;
   run: WorkbenchCommand;
+  openLog: (id: string) => void;
 }) {
   const path = base + `/tickets/${ticket.id}`;
   return (
@@ -247,7 +265,19 @@ function Checklist({
           </p>
           <p>
             {item.result || '尚无结果'}
-            {item.logId ? ' · 依据 ' + item.logId : ''}
+            {item.logId && (
+              <>
+                {' '}
+                ·{' '}
+                <button
+                  type="button"
+                  className={styles.textButton}
+                  onClick={() => openLog(item.logId!)}
+                >
+                  查看依据 {item.logId}
+                </button>
+              </>
+            )}
           </p>
           <div className={styles.actions}>
             <WorkbenchForm
@@ -410,6 +440,7 @@ function LogEntry({
       </p>
       <p>
         {logTypeLabels[log.type]} · {importanceLabels[log.importance]}
+        {log.collaborationId ? ' · 本票辅助记录' : ''}
         {log.corrects ? ' · 纠正 ' + log.corrects : ''}
       </p>
       <Markdown content={log.content} />
@@ -485,40 +516,56 @@ function Logs({
   path,
   projectId,
   run,
+  logId,
+  showAll,
 }: {
   path: string;
   projectId: string;
   run: WorkbenchCommand;
+  logId: string | null;
+  showAll: () => void;
 }) {
   const [mode, setMode] = useState('active'),
     query = useQuery({
-      queryKey: ['ticket-logs', projectId, path, mode],
-      queryFn: async () => z.array(logSchema).parse(await request(path + '/logs?mode=' + mode)),
+      queryKey: ['ticket-logs', projectId, path, mode, logId],
+      queryFn: async () =>
+        logId
+          ? [logSchema.parse(await request(path + '/logs/' + encodeURIComponent(logId)))]
+          : z.array(logSchema).parse(await request(path + '/logs?mode=' + mode)),
     });
   return (
     <section>
-      <div className={styles.actions}>
-        <label>
-          Log 查阅范围
-          <select
-            aria-label="Log 查阅范围"
-            value={mode}
-            onChange={(event) => setMode(event.target.value)}
+      {logId ? (
+        <p>
+          已定位原 Log {logId}。{' '}
+          <button type="button" className={styles.button} onClick={showAll}>
+            返回 Log 列表
+          </button>
+        </p>
+      ) : (
+        <div className={styles.actions}>
+          <label>
+            Log 查阅范围
+            <select
+              aria-label="Log 查阅范围"
+              value={mode}
+              onChange={(event) => setMode(event.target.value)}
+            >
+              <option value="active">当前有效</option>
+              <option value="archived">仅已归档</option>
+              <option value="all">包含全部</option>
+            </select>
+          </label>
+          <WorkbenchForm
+            title="追加工作 Log"
+            trigger="新增 Log"
+            description="以当前用户保存过程与依据。Log 不是授权、正式决定或独审结论。"
+            onSubmit={(form) => run(path + '/logs', logBody(form))}
           >
-            <option value="active">当前有效</option>
-            <option value="archived">仅已归档</option>
-            <option value="all">包含全部</option>
-          </select>
-        </label>
-        <WorkbenchForm
-          title="追加工作 Log"
-          trigger="新增 Log"
-          description="以当前用户保存过程与依据。Log 不是授权、正式决定或独审结论。"
-          onSubmit={(form) => run(path + '/logs', logBody(form))}
-        >
-          <LogFields />
-        </WorkbenchForm>
-      </div>
+            <LogFields />
+          </WorkbenchForm>
+        </div>
+      )}
       {query.isPending && <p role="status">正在读取 Log…</p>}
       {query.isError && (
         <p role="alert" className={styles.error}>
@@ -532,8 +579,17 @@ function Logs({
     </section>
   );
 }
-function Materials({ path, projectId }: { path: string; projectId: string }) {
-  const [directory, setDirectory] = useState(''),
+function Materials({
+  path,
+  projectId,
+  recordId,
+}: {
+  path: string;
+  projectId: string;
+  recordId: string | null;
+}) {
+  const linkedDirectory = recordId?.startsWith('dir:') ? recordId.slice(4) : '';
+  const [directory, setDirectory] = useState(linkedDirectory),
     [selected, setSelected] = useState<string | null>(null);
   const query = useQuery({
     queryKey: ['ticket-materials', projectId, path, directory],
@@ -550,21 +606,19 @@ function Materials({ path, projectId }: { path: string; projectId: string }) {
             }),
           ),
           note: z.string(),
-          currentDelivery: z.null(),
+          currentDelivery: ticketDeliverySchema.nullable(),
+          materialError: z.string().nullable(),
           executionDomains: z.array(materialDomainSchema),
         })
         .parse(await request(path + '/materials?path=' + encodeURIComponent(directory))),
   });
-  const preview = useQuery({
-    queryKey: ['material-preview', projectId, path, selected],
-    enabled: selected !== null,
-    queryFn: async () =>
-      z
-        .object({ path: z.string(), content: z.string() })
-        .parse(await request(path + '/material?path=' + encodeURIComponent(selected!))),
-  });
   return (
     <section>
+      <TicketDeliveryPanel
+        projectId={projectId}
+        ticketPath={path}
+        versionId={linkedDirectory ? null : recordId}
+      />
       <p className={styles.description}>
         材料根与实际执行域由软件分配。文件存在或名为“结果”不代表已送审或有效交付。
       </p>
@@ -577,7 +631,11 @@ function Materials({ path, projectId }: { path: string; projectId: string }) {
       {query.data && (
         <>
           <p className={styles.materialPath}>{query.data.root}</p>
-          <p>当前正式交付：尚未产生。</p>
+          {query.data.materialError && (
+            <p role="alert" className={styles.error}>
+              当前材料目录不可读：{query.data.materialError}
+            </p>
+          )}
           {query.data.executionDomains.length === 0 ? (
             <p>执行及独审域尚未分配。</p>
           ) : (
@@ -639,20 +697,13 @@ function Materials({ path, projectId }: { path: string; projectId: string }) {
               </li>
             ))}
           </ul>
-          {query.data.entries.length === 0 && <p>暂无材料。系统没有用示例文件代替成果。</p>}
+          {query.data.entries.length === 0 && !query.data.materialError && (
+            <p>当前目录暂无材料。</p>
+          )}
         </>
       )}
       {selected && (
-        <section>
-          <h4>{selected}</h4>
-          {preview.isPending && <p role="status">正在预览…</p>}
-          {preview.isError && (
-            <p role="alert" className={styles.error}>
-              {preview.error.message}
-            </p>
-          )}
-          {preview.data && <pre className={styles.filePreview}>{preview.data.content}</pre>}
-        </section>
+        <MaterialPreview key={selected} selected={liveMaterialPreview(path, selected)} />
       )}
     </section>
   );
@@ -711,22 +762,40 @@ function Revisions({ path, projectId }: { path: string; projectId: string }) {
     </section>
   );
 }
+export type TicketDetailSection =
+  | 'requirements'
+  | 'checklist'
+  | 'logs'
+  | 'materials'
+  | 'revisions'
+  | 'execution'
+  | 'acceptance'
+  | 'relationships'
+  | 'research';
 export function TicketDetails({
   projectId,
   ticketId,
   data,
   run,
+  section,
+  recordId,
+  onOpenTicket,
+  onSectionChange,
+  onOpenDecision,
 }: {
   projectId: string;
   ticketId: string;
   data: WorkbenchSnapshot;
   run: WorkbenchCommand;
+  section: TicketDetailSection;
+  recordId: string | null;
+  onOpenTicket: (id: string, section?: TicketDetailSection, recordId?: string) => void;
+  onSectionChange: (section: TicketDetailSection, recordId?: string) => void;
+  onOpenDecision: (id: string) => void;
 }) {
-  const [view, setView] = useState<
-      'requirements' | 'checklist' | 'logs' | 'materials' | 'revisions' | 'execution' | 'acceptance'
-    >('requirements'),
-    base = `/api/projects/${projectId}`,
+  const base = `/api/projects/${projectId}`,
     path = base + `/tickets/${ticketId}`;
+  const setView = onSectionChange;
   const query = useQuery({
     queryKey: ['ticket', projectId, ticketId],
     queryFn: async () => ticketSchema.parse(await request(path)),
@@ -738,7 +807,8 @@ export function TicketDetails({
         {query.error.message}
       </p>
     );
-  const ticket = query.data;
+  const ticket = query.data,
+    view = section === 'research' && ticket.kind !== 'research' ? 'requirements' : section;
   return (
     <section className={styles.ticketDetails} aria-label="票据详情">
       <div className={styles.sectionHeader}>
@@ -755,27 +825,49 @@ export function TicketDetails({
           [
             ['requirements', '要求'],
             ['checklist', 'Checklist'],
+            ['research', '研究问题'],
             ['logs', 'Log'],
             ['materials', '材料'],
+            ['relationships', '协作与关联'],
             ['execution', '执行观察'],
             ['acceptance', '审阅与验收'],
             ['revisions', '修订历史'],
           ] as const
-        ).map(([key, label]) => (
-          <button
-            type="button"
-            key={key}
-            role="tab"
-            aria-selected={view === key}
-            onClick={() => setView(key)}
-          >
-            {label}
-          </button>
-        ))}
+        )
+          .filter(([key]) => key !== 'research' || ticket.kind === 'research')
+          .map(([key, label]) => (
+            <button
+              type="button"
+              key={key}
+              role="tab"
+              aria-selected={view === key}
+              onClick={() => setView(key)}
+            >
+              {label}
+            </button>
+          ))}
       </div>
       {view === 'requirements' && (
         <>
           <EditTicket ticket={ticket} data={data} base={base} run={run} />
+          {ticket.planId && (
+            <details>
+              <summary>建票规划与确认依据</summary>
+              <p>规划 ID：{ticket.planId}</p>
+              {data.plans
+                .filter((plan) => plan.id === ticket.planId)
+                .map((plan) => (
+                  <div key={plan.id}>
+                    <p>目标：{plan.goal}</p>
+                    <p>范围：{plan.included}</p>
+                    <p>
+                      确认：{plan.confirmation?.reason ?? '待核对'} · {plan.confirmation?.at}
+                    </p>
+                    <Markdown content={plan.content} />
+                  </div>
+                ))}
+            </details>
+          )}
           <h4>主要结果</h4>
           <Markdown content={ticket.goal} />
           <h4>包含范围</h4>
@@ -783,11 +875,30 @@ export function TicketDetails({
           <h4>不包含</h4>
           <Markdown content={ticket.excluded || '未填写'} />
           <h4>直接依赖</h4>
-          <p>
-            {ticket.dependencies
-              .map((id) => data.tickets.find((value) => value.id === id)?.code ?? id)
-              .join('、') || '无'}
-          </p>
+          {ticket.dependencies.length ? (
+            <ul>
+              {ticket.dependencies.map((id) => {
+                const dependency = data.tickets.find((value) => value.id === id);
+                return (
+                  <li key={id}>
+                    {dependency ? (
+                      <button
+                        type="button"
+                        className={styles.textButton}
+                        onClick={() => onOpenTicket(id)}
+                      >
+                        {dependency.code} · {dependency.title}
+                      </button>
+                    ) : (
+                      <span>前置票据暂不可读 · {id}</span>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          ) : (
+            <p>无</p>
+          )}
           <div className={styles.actions}>
             <p>正式派工请通过 Chat 向主管提出；此处只读观察，不代替主管身份。</p>
             <button type="button" className={styles.button} onClick={() => setView('acceptance')}>
@@ -796,10 +907,43 @@ export function TicketDetails({
           </div>
         </>
       )}
-      {view === 'checklist' && <Checklist ticket={ticket} base={base} run={run} />}
-      {view === 'acceptance' && <TicketAcceptance projectId={projectId} ticketId={ticket.id} />}
-      {view === 'logs' && <Logs path={path} projectId={projectId} run={run} />}
-      {view === 'materials' && <Materials path={path} projectId={projectId} />}
+      {view === 'checklist' && (
+        <Checklist ticket={ticket} base={base} run={run} openLog={(id) => setView('logs', id)} />
+      )}
+      {view === 'research' && ticket.kind === 'research' && (
+        <ResearchDetails projectId={projectId} ticketId={ticket.id} run={run} />
+      )}
+      {view === 'acceptance' && (
+        <TicketAcceptance
+          projectId={projectId}
+          ticketId={ticket.id}
+          openVersion={(id) => setView('materials', id)}
+          recordId={recordId}
+          showAll={() => setView('acceptance')}
+        />
+      )}
+      {view === 'logs' && (
+        <Logs
+          path={path}
+          projectId={projectId}
+          run={run}
+          logId={recordId}
+          showAll={() => setView('logs')}
+        />
+      )}
+      {view === 'materials' && (
+        <Materials key={recordId ?? 'root'} path={path} projectId={projectId} recordId={recordId} />
+      )}
+      {view === 'relationships' && (
+        <TicketRelatedRecords
+          path={path}
+          projectId={projectId}
+          openLog={(id) => setView('logs', id)}
+          openMaterial={(directory) => setView('materials', 'dir:' + directory)}
+          openDelivery={(id, version) => onOpenTicket(id, 'materials', version)}
+          openDecision={onOpenDecision}
+        />
+      )}
       {view === 'execution' && (
         <ExecutionObservation
           projectId={projectId}

@@ -1,5 +1,6 @@
 import { test, expect } from 'vitest';
 import { randomUUID } from 'node:crypto';
+import { historyTargets } from '../src/services/history-navigation.ts';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { resultServiceFixture } from './review-result-runtime-fixture.ts';
@@ -130,6 +131,32 @@ test('实际主管安排验收，指定责任方记录并显式关联Log/Checkli
     expect(accepted.versionId).toBe(versionId);
     expect(f.connection.workbench().getTicket(f.ticket.id).state).toBe('completed');
     expect(catalog.complete(f.managerActor, complete).id).toBe(accepted.id);
+    const history = f.connection.workbench().projectHistory();
+    const phaseEvent = history.find(
+      (entry) => entry.kind === 'phase-opened' && entry.objectId === f.ticket.phaseId,
+    )!;
+    expect(historyTargets(f.connection, phaseEvent.id)).toContainEqual(
+      expect.objectContaining({ kind: 'phase', recordId: f.ticket.phaseId }),
+    );
+    const recordEvent = history.find(
+      (entry) => entry.kind === 'acceptance-recorded' && entry.references.includes(saved.id),
+    )!;
+    expect(historyTargets(f.connection, recordEvent.id)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'acceptance',
+          ticketId: f.ticket.id,
+          recordId: assignment.id,
+        }),
+        expect.objectContaining({ kind: 'acceptance', ticketId: f.ticket.id, recordId: saved.id }),
+      ]),
+    );
+    const acceptedEvent = history.find(
+      (entry) => entry.kind === 'ticket-accepted' && entry.references.includes(accepted.id),
+    )!;
+    expect(historyTargets(f.connection, acceptedEvent.id)).toContainEqual(
+      expect.objectContaining({ kind: 'acceptance', ticketId: f.ticket.id, recordId: accepted.id }),
+    );
   } finally {
     await f.dispose();
   }

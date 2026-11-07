@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
-import type { NativeAgent, NativeContext } from './native.ts';
+import type { NativeAgent, NativeContext, ToolDefinition } from './native.ts';
 import { ProjectError } from '../services/errors.ts';
 export interface RangeFact {
   id: string;
@@ -34,7 +34,8 @@ export class NativeProcessRanges {
       this.restore = () => {};
       return;
     }
-    const original = service.spawn,
+    const originalDescriptor = Object.getOwnPropertyDescriptor(service, 'spawn'),
+      original = service.spawn,
       currentScope = () => (this.closed ? undefined : this.storage.getStore()),
       commit = (fact: RangeFact) => this.commit(fact);
     const wrapped = function (this: unknown, spec: unknown) {
@@ -78,10 +79,19 @@ export class NativeProcessRanges {
       return handle;
     };
     try {
-      service.spawn = wrapped;
-      this.available = service.spawn === wrapped;
+      // Cordis returns a fresh method proxy on every read. Compare the installed
+      // own descriptor, not the contextual method returned by its get trap.
+      Object.defineProperty(service, 'spawn', {
+        configurable: true,
+        writable: true,
+        enumerable: originalDescriptor?.enumerable ?? false,
+        value: wrapped,
+      });
+      this.available = Object.getOwnPropertyDescriptor(service, 'spawn')?.value === wrapped;
       this.restore = () => {
-        if (service.spawn === wrapped) service.spawn = original;
+        if (Object.getOwnPropertyDescriptor(service, 'spawn')?.value !== wrapped) return;
+        if (originalDescriptor) Object.defineProperty(service, 'spawn', originalDescriptor);
+        else Reflect.deleteProperty(service, 'spawn');
       };
     } catch {
       this.available = false;
@@ -97,32 +107,41 @@ export class NativeProcessRanges {
       /* Durable job reconciliation will retain unknown if the database is unavailable. */
     }
   }
+  wrap(
+    definition: ToolDefinition,
+    owner: NativeAgent,
+    projectId: string,
+    sessionId: string,
+    validate: (agent: NativeAgent, toolName: string) => void,
+  ): ToolDefinition {
+    if (!this.available) return definition;
+    return {
+      ...definition,
+      execute: (args, exec) => {
+        if (exec.agent !== owner)
+          throw new ProjectError('TOOL_CALLER_MISMATCH', '原生工具不属于实际MAT调用会话');
+        validate(owner, definition.name);
+        if (!exec.callId) return definition.execute(args, exec);
+        return this.storage.run(
+          { projectId, sessionId, nativeOwner: owner.id, callId: exec.callId },
+          () => definition.execute(args, exec),
+        );
+      },
+    };
+  }
   install(
     ctx: NativeContext,
     owner: NativeAgent,
     projectId: string,
     sessionId: string,
-    validate: (agent: NativeAgent) => void,
+    validate: (agent: NativeAgent, toolName: string) => void,
   ): void {
     if (!this.available) return;
     for (const definition of ctx.tools.definitions(owner)) {
-      if (definition.name === 'run_code' || typeof definition.execute !== 'function') continue;
-      ctx.tools.register({
-        ...definition,
-        execute: (
-          args: unknown,
-          exec: { agent?: NativeAgent; signal: AbortSignal; callId?: string },
-        ) => {
-          if (exec.agent !== owner)
-            throw new ProjectError('TOOL_CALLER_MISMATCH', '原生工具不属于实际MAT调用会话');
-          validate(owner);
-          if (!exec.callId) return definition.execute(args, exec);
-          return this.storage.run(
-            { projectId, sessionId, nativeOwner: owner.id, callId: exec.callId },
-            () => definition.execute(args, exec),
-          );
-        },
-      });
+      // Native command tools are inherited. MAT tools are wrapped before their first scoped registration.
+      if (!['pwsh', 'bash'].includes(definition.name) || typeof definition.execute !== 'function')
+        continue;
+      ctx.tools.register(this.wrap(definition, owner, projectId, sessionId, validate));
     }
   }
   forSession(sessionId: string): RangeFact[] {

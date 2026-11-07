@@ -8,7 +8,11 @@ export const supplementInputSchema = z
     versionId: z.uuid(),
     resultId: z.uuid(),
     reason: z.string().trim().min(1).max(16000),
-    dispatch: dispatchBodySchema.omit({ ticket: true, sessionId: true }),
+    dispatch: dispatchBodySchema.omit({
+      ticket: true,
+      sessionId: true,
+      reuseClosedExecutionId: true,
+    }),
   })
   .strict();
 export const escalationInputSchema = z

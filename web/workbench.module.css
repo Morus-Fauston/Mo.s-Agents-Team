@@ -12,6 +12,15 @@
 :global(body) {
   margin: 0;
 }
+.materialPreview {
+  margin-block-start: 16px;
+  min-width: 0;
+}
+.materialImage {
+  max-width: 100%;
+  max-height: 520px;
+  object-fit: contain;
+}
 :global(button),
 :global(input) {
   font: inherit;

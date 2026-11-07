@@ -39,8 +39,52 @@ export const phaseInputSchema = operationSchema
 export const categoryInputSchema = operationSchema
   .extend({ code: z.string().regex(/^[A-Z]{1,16}$/), name: title })
   .strict();
+export const researchQuestionFieldsSchema = z.object({
+  title,
+  question: z.string().trim().min(1).max(16000),
+  condition: z.string().trim().min(1).max(16000),
+  sources: z.array(z.string().min(1).max(4000)).max(128).optional(),
+  order: z.number().int().nonnegative().optional(),
+});
+export const researchQuestionInputSchema = researchQuestionFieldsSchema
+  .extend({ operationId: z.uuid() })
+  .strict();
+export const researchQuestionUpdateSchema = researchQuestionFieldsSchema
+  .partial()
+  .extend({ operationId: z.uuid(), expectedRevision: z.number().int().positive(), reason: text })
+  .strict();
+export const researchQuestionSchema = researchQuestionFieldsSchema.extend({
+  id: z.string().regex(/^Q\d{2,}$/),
+  revision: z.number().int().positive(),
+  definitionRevision: z.number().int().positive(),
+  sources: z.array(z.string()),
+  order: z.number().int().nonnegative(),
+});
+export const researchDefinitionSchema = z.object({
+  body: z.string(),
+  questions: z.array(researchQuestionSchema),
+});
+export const researchAnswerBodySchema = z
+  .object({
+    expectedQuestionRevision: z.number().int().positive(),
+    expectedAnswerRevision: z.number().int().nonnegative(),
+    status: z.enum(['answered', 'unconfirmed', 'gap']),
+    content: z.string().trim().min(1).max(48000),
+    evidence: z.array(z.string().min(1).max(4000)).max(256).default([]),
+    unconfirmed: z.string().max(16000).default(''),
+  })
+  .strict();
+export const researchAnswerInputSchema = researchAnswerBodySchema
+  .extend({ operationId: z.uuid() })
+  .superRefine((v, ctx) => {
+    if (v.status !== 'answered' && !v.unconfirmed.trim())
+      ctx.addIssue({ code: 'custom', message: '未确认或缺口须说明具体边界' });
+  });
 export const ticketInputSchema = operationSchema
   .extend({
+    planId: z.uuid().optional(),
+    kind: z.enum(['development', 'research']).default('development'),
+    researchBody: z.string().max(128000).default(''),
     phaseId: z.uuid(),
     categoryId: z.uuid(),
     title,
@@ -56,6 +100,7 @@ export const ticketUpdateSchema = operationSchema
   .extend({
     expectedRevision: z.number().int().positive(),
     reason: text,
+    researchBody: z.string().max(128000).optional(),
     phaseId: z.uuid().optional(),
     categoryId: z.uuid().optional(),
     title: title.optional(),
@@ -129,6 +174,46 @@ export const authorSchema = z.object({
   roleType: z.string().nullable(),
   address: z.string().nullable(),
 });
+export const researchAnswerSchema = z.object({
+  id: z.uuid(),
+  questionId: z.string().regex(/^Q\d{2,}$/),
+  questionRevision: z.number().int().positive(),
+  revision: z.number().int().positive(),
+  status: z.enum(['answered', 'unconfirmed', 'gap']),
+  content: z.string(),
+  evidence: z.array(z.string()),
+  unconfirmed: z.string(),
+  executionId: z.uuid(),
+  author: authorSchema,
+  createdAt: z.string(),
+  previousAnswerId: z.uuid().nullable(),
+});
+export type ResearchQuestion = z.infer<typeof researchQuestionSchema>;
+export type ResearchAnswer = z.infer<typeof researchAnswerSchema>;
+export const planInputSchema = operationSchema
+  .extend({
+    phaseId: z.uuid(),
+    goal: text,
+    included: text,
+    excluded: z.string(),
+    content: text,
+    basis: text,
+  })
+  .strict();
+export const planSchema = z.object({
+  id: z.uuid(),
+  phaseId: z.uuid(),
+  goal: text,
+  included: text,
+  excluded: z.string(),
+  content: text,
+  basis: text,
+  author: authorSchema,
+  createdAt: z.string(),
+  revision: z.number().int().positive(),
+  confirmation: z.object({ author: authorSchema, at: z.string(), reason: text }).nullable(),
+});
+export type PlanRecord = z.infer<typeof planSchema>;
 export type WorkbenchActor = { kind: 'user' } | { kind: 'session'; sessionId: string };
 export type RecordAuthor = z.infer<typeof authorSchema>;
 export const checklistItemSchema = conditionInputSchema.extend({
@@ -162,6 +247,9 @@ export const categorySchema = z.object({
   createdAt: z.string(),
 });
 export const ticketSchema = z.object({
+  planId: z.uuid().nullable().default(null),
+  kind: z.enum(['development', 'research']).default('development'),
+  research: researchDefinitionSchema.nullable().default(null),
   id: z.uuid(),
   code: z.string(),
   phaseId: z.uuid(),
@@ -189,6 +277,7 @@ export const logSchema = logInputSchema.omit({ corrects: true }).extend({
   author: authorSchema,
   createdAt: z.string(),
   executionId: z.string().nullable(),
+  collaborationId: z.uuid().nullable().default(null),
 });
 export const feedbackSchema = feedbackInputSchema.omit({ operationId: true }).extend({
   id: z.string(),
@@ -222,6 +311,10 @@ export const supervisorTaskSchema = z.object({
   author: authorSchema,
   createdAt: z.string(),
   revision: z.number(),
+  business: z
+    .object({ kind: z.enum(['local-commit', 'worktree-merge']), id: z.uuid() })
+    .nullable()
+    .optional(),
 });
 export type PhaseRecord = z.infer<typeof phaseSchema>;
 export type TicketRecord = z.infer<typeof ticketSchema>;

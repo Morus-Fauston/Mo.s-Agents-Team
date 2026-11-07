@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { authorSchema, ticketSchema } from './workbench.ts';
+import { authorSchema, ticketSchema, researchAnswerSchema } from './workbench.ts';
 export const snapshotFileSchema = z.object({
   path: z.string(),
   sha256: z.string(),
@@ -10,9 +10,17 @@ export const snapshotFileSchema = z.object({
 export const snapshotRootSchema = z.object({
   root: z.string(),
   kind: z.enum(['git', 'files']),
+  commonDir: z.string().nullable().default(null),
   head: z.string().nullable(),
   tree: z.string().nullable(),
   ref: z.string().nullable(),
+  indexState: z
+    .object({
+      head: z.string(),
+      mergeHeads: z.array(z.string()),
+      indexFingerprint: z.string(),
+    })
+    .optional(),
   files: z.array(snapshotFileSchema),
 });
 export const workspaceSnapshotSchema = z.object({
@@ -33,6 +41,15 @@ export interface SnapshotInput {
   excluded?: string[];
   maxFiles?: number;
   maxBytes?: number;
+  /** Internal capability supplied from an explicitly linked merge-repair execution. */
+  mergeRepair?:
+    | {
+        repository: string;
+        expectedHead: string;
+        expectedMergeHeads: string[];
+        expectedIndexFingerprint: string;
+      }
+    | undefined;
 }
 export interface WorkspaceDiff {
   changes: {
@@ -51,6 +68,7 @@ export const deliveryVersionInputSchema = z
     scope: z.string().trim().min(1).max(32768),
     evidencePaths: z.array(z.string().min(1)).max(1000).default([]),
     checklistItemIds: z.array(z.string().min(1)).max(1000).default([]),
+    reportPaths: z.array(z.string().min(1)).max(128).default([]),
   })
   .strict();
 export const deliveryVersionSchema = z.object({
@@ -58,6 +76,7 @@ export const deliveryVersionSchema = z.object({
   operationId: z.uuid(),
   executionId: z.uuid(),
   kind: z.enum(['baseline', 'delivery']),
+  worktreeId: z.uuid().nullable().default(null),
   sequence: z.number().int().nonnegative(),
   actor: authorSchema,
   ticket: ticketSchema,
@@ -65,6 +84,8 @@ export const deliveryVersionSchema = z.object({
   scope: z.string(),
   evidencePaths: z.array(z.string()),
   checklistItemIds: z.array(z.string().min(1)),
+  reportPaths: z.array(z.string()).default([]),
+  researchAnswers: z.array(researchAnswerSchema).default([]),
   snapshot: workspaceSnapshotSchema,
   createdAt: z.string(),
 });
@@ -74,6 +95,7 @@ export const versionHeaderSchema = deliveryVersionSchema
     id: true,
     executionId: true,
     kind: true,
+    worktreeId: true,
     sequence: true,
     summary: true,
     scope: true,
@@ -81,6 +103,7 @@ export const versionHeaderSchema = deliveryVersionSchema
   })
   .extend({
     fingerprint: z.string(),
+    ticketKind: z.enum(['development', 'research']).default('development'),
     roots: z.array(
       snapshotRootSchema
         .omit({ files: true })

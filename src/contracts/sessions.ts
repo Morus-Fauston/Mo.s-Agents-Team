@@ -24,6 +24,15 @@ export const sessionSchema = z.object({
   status: z.enum(['creating', 'bound', 'failed', 'closed']),
   error: z.string().nullable(),
   communicationState: z.enum(['active', 'paused', 'terminated', 'archived']),
+  communicationOrigin: z
+    .object({
+      kind: z.literal('execution-closed'),
+      executionId: z.uuid(),
+      resultId: z.uuid(),
+      at: z.string(),
+    })
+    .nullable()
+    .default(null),
   addresses: z.object({ readable: z.string(), numeric: z.string() }),
 });
 export type SessionInput = z.infer<typeof sessionInputSchema>;

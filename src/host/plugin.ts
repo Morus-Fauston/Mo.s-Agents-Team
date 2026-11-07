@@ -11,6 +11,7 @@ interface PluginContext {
   logger?: { info(message: string): void; error?(message: string): void };
 }
 interface PluginConfiguration {
+  projectRoot?: string;
   stateDirectory?: string;
   port?: number;
 }
@@ -26,6 +27,8 @@ export const inject = [
   'subprocess',
 ];
 export function apply(ctx: PluginContext & NativeContext, config: PluginConfiguration = {}): void {
+  if (!config.projectRoot) throw new Error('MAT 必须显式配置 projectRoot 为宿主项目绝对目录');
+  const projectRoot = config.projectRoot;
   ctx.effect(() => {
     const state =
       config.stateDirectory ??
@@ -33,6 +36,7 @@ export function apply(ctx: PluginContext & NativeContext, config: PluginConfigur
     // Preset activation waits for the Loader tree to settle; do not make that
     // same tree wait for this asynchronous console boot.
     const opening = startConsole({
+      projectRoot,
       stateDirectory: state,
       port: config.port ?? 0,
       assetsDirectory: fileURLToPath(new URL('../web/', import.meta.url)),

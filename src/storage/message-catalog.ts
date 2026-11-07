@@ -21,6 +21,10 @@ import { transaction } from './transaction.ts';
 import { SessionCatalog } from './session-catalog.ts';
 import { RoleCatalog } from './role-catalog.ts';
 import { reviewResultSchema } from '../contracts/review-results.ts';
+import { collaborationResultSchema } from '../contracts/collaboration-results.ts';
+import { collaborationFaultSchema } from '../contracts/collaboration.ts';
+import { assistantControlSchema } from '../contracts/assistant-controls.ts';
+import { decisionNoticeSchema } from '../contracts/decision-requests.ts';
 export function migrateMessages(db: DatabaseSync): void {
   db.exec(`ALTER TABLE session ADD COLUMN communication_state TEXT NOT NULL DEFAULT 'active' CHECK(communication_state IN('active','paused','terminated','archived'));
  CREATE TABLE conversation(id TEXT PRIMARY KEY,party_a TEXT NOT NULL,party_b TEXT NOT NULL,opened_by_user INTEGER NOT NULL CHECK(opened_by_user IN(0,1)),UNIQUE(party_a,party_b));
@@ -49,6 +53,21 @@ export class MessageCatalog {
     return this.saveInternal({ kind: 'system' }, this.controlMessage(id, kind), false);
   }
   private allowsControlledResult(id: string, sessionId: string): boolean {
+    for (const row of this.db
+      .prepare("SELECT data FROM collaboration_result WHERE json_extract(data,'$.sessionId')=?")
+      .all(sessionId)) {
+      const result = collaborationResultSchema.parse(JSON.parse(String(row.data))),
+        notice = result.notices.find((n) => n.id === id);
+      if (notice) {
+        const saved = this.get(id);
+        return (
+          saved.message.sender.sessionId === sessionId &&
+          saved.receipt.targetSessionId === notice.targetSessionId &&
+          saved.message.content === notice.content &&
+          saved.message.references.length === 0
+        );
+      }
+    }
     const expected = this.controlledResult?.(id, sessionId);
     if (!expected) return false;
     const saved = this.get(id);
@@ -127,12 +146,77 @@ export class MessageCatalog {
   save(actor: ChatActor, raw: ChatInput): SavedMessage {
     return this.saveInternal(actor, raw, false);
   }
+  saveCollaborationResult(resultId: string, noticeId: string): SavedMessage {
+    const row = this.db.prepare('SELECT data FROM collaboration_result WHERE id=?').get(resultId);
+    if (!row)
+      throw new ProjectError('COLLABORATION_RESULT_NOT_FOUND', '没有正式协作结果，不能伪造通知');
+    const result = collaborationResultSchema.parse(JSON.parse(String(row.data))),
+      notice = result.notices.find((n) => n.id === noticeId);
+    if (
+      !notice ||
+      notice.targetSessionId !== result.parentSessionId ||
+      result.author.sessionId !== result.sessionId
+    )
+      throw new ProjectError('COLLABORATION_NOTICE_SOURCE', '通知不对应实际原协作来源与主负责人');
+    return this.saveInternal(
+      { kind: 'session', sessionId: result.sessionId },
+      { id: notice.id, target: notice.targetSessionId, content: notice.content },
+      true,
+    );
+  }
+  saveCollaborationFault(id: string): SavedMessage {
+    const row = this.db
+      .prepare(
+        "SELECT data FROM workbench_revision WHERE kind='collaboration-fault' AND object_id=? ORDER BY seq LIMIT 1",
+      )
+      .get(id);
+    if (!row) throw new ProjectError('COLLABORATION_FAULT_NOT_FOUND', '没有持久故障来源');
+    const fault = collaborationFaultSchema.parse(JSON.parse(String(row.data)).value);
+    return this.saveInternal(
+      { kind: 'system' },
+      {
+        id: fault.id,
+        target: fault.parentSessionId,
+        content: JSON.stringify({
+          ...fault,
+          note:
+            fault.kind === 'control'
+              ? '实际辅助控制状态，先由原主负责人核对；不是正常完成，不清除其他等待或独立暂停。'
+              : '协作运行或准备故障，先由原主负责人处理；不清除其他等待、不重派或解除控制。',
+        }),
+      },
+      false,
+    );
+  }
+  saveAssistantControl(id: string, kind: 'request' | 'resume'): SavedMessage {
+    const row = this.db.prepare('SELECT data FROM assistant_control WHERE id=?').get(id);
+    if (!row) throw new ProjectError('ASSISTANT_CONTROL_NOT_FOUND', '没有实际辅助控制来源');
+    const v = assistantControlSchema.parse(JSON.parse(String(row.data)));
+    if (
+      (kind === 'resume' && v.action !== 'resume') ||
+      (kind === 'request' && (v.stopMode !== 'soft' || v.action === 'resume'))
+    )
+      throw new ProjectError('ASSISTANT_CONTROL_MESSAGE', '此辅助控制没有对应通知');
+    return this.saveInternal(
+      { kind: 'system' },
+      {
+        id: kind === 'request' ? v.messageId : v.resumeMessageId,
+        target: v.sessionId,
+        content:
+          kind === 'request'
+            ? `MAT本次辅助软停止要求。控制ID=${v.id}，协作=${v.collaborationId}。停止展开新工作，结束自己启动的后台作业，保存当前小块和必要Log及恢复位置。不要自动Git或更新Checklist。然后只用mat_chat action=hangup、controlId=${v.id}和content回报，不填target。这不是普通依赖等待，不填dependencies或resumeCondition。\n原因：${v.reason}\n收尾正文：${v.content}`
+            : `MAT明确恢复原辅助。控制ID=${v.id}，协作=${v.collaborationId}。沿原票授权核对最新现场、已保存结果和未办输入，不重放已办或结果未知的副作用，不创建新Goal。恢复请求不等于新的授权。\n原因：${v.reason}\n现场：${JSON.stringify(v.resumeSnapshot)}`,
+      },
+      false,
+    );
+  }
   saveSystem(raw: ChatInput): SavedMessage {
     const input = chatInputSchema.parse(raw);
     if (
       input.target === 'user' ||
       input.replyTo ||
       input.references.length ||
+      input.allowedChecklistIds !== undefined ||
       this.resolveTarget(input.target).roleType !== 'supervisor'
     )
       throw new ProjectError(
@@ -149,6 +233,16 @@ export class MessageCatalog {
     return this.saveInternal(
       { kind: 'system' },
       { id: notice.id, target: notice.targetSessionId, content: notice.content },
+      false,
+    );
+  }
+  saveDecisionNotice(id: string): SavedMessage {
+    const row = this.db.prepare('SELECT data FROM decision_request_notice WHERE id=?').get(id);
+    if (!row) throw new ProjectError('DECISION_NOTICE_NOT_FOUND', '没有同事务保存的决定请求通知');
+    const notice = decisionNoticeSchema.parse(JSON.parse(String(row.data)));
+    return this.saveInternal(
+      { kind: 'system' },
+      { id: notice.id, target: notice.target.sessionId ?? 'user', content: notice.content },
       false,
     );
   }
@@ -196,6 +290,24 @@ export class MessageCatalog {
           ? { kind: 'user' as const }
           : { kind: 'session' as const, sessionId: this.resolveTarget(input.target).id };
       const recipient = this.participant(target);
+      if (input.allowedChecklistIds !== undefined) {
+        const row = this.db
+          .prepare("SELECT data FROM collaboration WHERE session_id=? AND state='active'")
+          .get(recipient.sessionId ?? '');
+        const a = row ? JSON.parse(String(row.data)) : null;
+        if (
+          actor.kind !== 'session' ||
+          a?.parentSessionId !== actor.sessionId ||
+          a?.checklistGrant?.messageId !== input.id ||
+          JSON.stringify(a.checklistGrant.ids) !==
+            JSON.stringify([...new Set(input.allowedChecklistIds)])
+        ) {
+          // Old messages may be retried after a later replacement or revocation.
+          const existing = this.db.prepare('SELECT id FROM chat_message WHERE id=?').get(input.id);
+          if (!existing)
+            throw new ProjectError('CHECKLIST_GRANT_SOURCE', '缺少同事务保存的真实主负责人授权');
+        }
+      }
       const senderKey = sender.kind === 'system' ? 'mat-platform' : (sender.sessionId ?? 'user'),
         recipientKey = recipient.sessionId ?? 'user';
       if (senderKey === recipientKey)
@@ -208,6 +320,9 @@ export class MessageCatalog {
             content: input.content,
             replyTo: input.replyTo ?? null,
             references: input.references,
+            ...(input.allowedChecklistIds === undefined
+              ? {}
+              : { allowedChecklistIds: input.allowedChecklistIds }),
           }),
         )
         .digest('hex');
@@ -289,6 +404,9 @@ export class MessageCatalog {
         content: input.content,
         replyTo: input.replyTo ?? null,
         references: input.references,
+        ...(input.allowedChecklistIds === undefined
+          ? {}
+          : { allowedChecklistIds: input.allowedChecklistIds }),
         savedAt: new Date().toISOString(),
       };
       const receipt: DeliveryRecord = {
@@ -345,20 +463,33 @@ export class MessageCatalog {
           (actor.kind === 'user' || session.id !== actor.sessionId) &&
           (identifier === undefined || session.roleId === selected?.id),
       )
-      .map((session) => ({
-        target: session.addresses.readable,
-        alternateTarget: session.addresses.numeric,
-        sessionId: session.id,
-        roleId: session.roleId,
-        roleCode: roles.find((role) => role.id === session.roleId)!.code,
-        name: session.name,
-        purpose: session.purpose,
-        type: session.roleType,
-        communicationState: session.communicationState,
-        configuration: session.configuration,
-        configurationBasis: 'session-snapshot',
-        responsibility: '未由聊天推定派工责任',
-      }));
+      .map((session) => {
+        const linked = this.db
+          .prepare("SELECT data FROM collaboration WHERE session_id=? AND state!='completed'")
+          .get(session.id);
+        const collaboration = linked
+          ? (JSON.parse(String(linked.data)) as {
+              id: string;
+              ticketId: string;
+              parentSessionId: string;
+            })
+          : null;
+        return {
+          target: session.addresses.readable,
+          alternateTarget: session.addresses.numeric,
+          sessionId: session.id,
+          roleId: session.roleId,
+          roleCode: roles.find((role) => role.id === session.roleId)!.code,
+          name: session.name,
+          purpose: session.purpose,
+          type: session.roleType,
+          communicationState: session.communicationState,
+          configuration: session.configuration,
+          configurationBasis: 'session-snapshot',
+          responsibility: collaboration ? '本票辅助；先向主负责人回传' : '未由聊天推定派工责任',
+          collaboration,
+        };
+      });
     const userAllowed =
       actor.kind === 'session' &&
       (this.sessions.get(actor.sessionId).roleType === 'supervisor' ||
@@ -406,9 +537,60 @@ export class MessageCatalog {
       return saved;
     });
   }
+  private localCommitNotice: ((id: string) => boolean) | undefined;
+  private localCommitInput: ((id: string, noticeId: string) => ChatInput) | undefined;
+  bindLocalCommitNotices(
+    check: (id: string) => boolean,
+    input: (id: string, noticeId: string) => ChatInput,
+  ): void {
+    this.localCommitNotice = check;
+    this.localCommitInput = input;
+  }
+  saveLocalCommitNotice(id: string, noticeId: string): SavedMessage {
+    const input = this.localCommitInput?.(id, noticeId);
+    if (!input) throw new ProjectError('LOCAL_COMMIT_NOTICE', '本地事项通知尚未接入原记录');
+    return this.saveInternal({ kind: 'system' }, input, false);
+  }
+
+  private mergeNotice: ((id: string) => boolean) | undefined;
+  private mergeInput: ((id: string, notice: string) => ChatInput) | undefined;
+  bindMergeNotices(
+    check: (id: string) => boolean,
+    input: (id: string, notice: string) => ChatInput,
+  ) {
+    this.mergeNotice = check;
+    this.mergeInput = input;
+  }
+  saveMergeNotice(id: string, notice: string): SavedMessage {
+    const input = this.mergeInput?.(id, notice);
+    if (!input) throw new ProjectError('MERGE_NOTICE', '合入通知尚未接入原记录');
+    return this.saveInternal({ kind: 'system' }, input, false);
+  }
+  currentDecisionNotice(id: string): boolean {
+    const row = this.db.prepare('SELECT data FROM decision_request_notice WHERE id=?').get(id);
+    if (!row) return (this.localCommitNotice?.(id) ?? true) && (this.mergeNotice?.(id) ?? true);
+    const notice = decisionNoticeSchema.parse(JSON.parse(String(row.data))),
+      request = this.db
+        .prepare('SELECT data FROM decision_request WHERE id=?')
+        .get(notice.requestId);
+    return !!request && JSON.parse(String(request.data)).revision === notice.revision;
+  }
+  holdObsoleteDecisionNotice(id: string): boolean {
+    if (this.currentDecisionNotice(id)) return false;
+    this.changeReceipt(id, (receipt) => {
+      receipt.state = 'held';
+      receipt.error = '原事项已有更新或已结束，旧提示仅保留历史，不再推进';
+    });
+    return true;
+  }
   beginDelivery(id: string): SavedMessage {
     return this.changeReceipt(id, (receipt) => {
       if (receipt.targetSessionId === null || receipt.enteredAt !== null) return;
+      if (!this.currentDecisionNotice(id)) {
+        receipt.state = 'held';
+        receipt.error = '原事项已有更新或已结束，旧提示仅保留历史，不再推进';
+        return;
+      }
       const target = this.sessions.get(receipt.targetSessionId);
       if (target.error !== null) {
         receipt.state = 'held';

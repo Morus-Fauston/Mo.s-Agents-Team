@@ -47,7 +47,7 @@ function git(
   args: string[],
   options: { input?: Buffer; index?: string; allowFailure?: boolean } = {},
 ) {
-  const env = { ...process.env, GIT_OPTIONAL_LOCKS: '0' };
+  const env = { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_NO_LAZY_FETCH: '1' };
   for (const key of [
     'GIT_INDEX_FILE',
     'GIT_DIR',
@@ -90,6 +90,7 @@ function gitFiles(
   root: string,
   excluded: string[],
   budget: { files: number; bytes: number; maxFiles: number; maxBytes: number },
+  mergeRepair = false,
 ) {
   const names = [
     ...new Set(
@@ -107,8 +108,10 @@ function gitFiles(
     const tab = entry.indexOf('\t'),
       [mode, , stage] = entry.slice(0, tab).split(' '),
       path = entry.slice(tab + 1);
-    if (stage !== '0' || mode === '160000')
+    if ((stage !== '0' && !(mergeRepair && ['1', '2', '3'].includes(stage!))) || mode === '160000')
       throw new ProjectError('SNAPSHOT_STRUCTURE', '未合并索引或子模块不能冒充完整工作区：' + path);
+    if (modes.has(path) && modes.get(path) !== mode)
+      throw new ProjectError('SNAPSHOT_STRUCTURE', '修正快照不猜测冲突的文件类型：' + path);
     modes.set(path, mode!);
   }
   return names.flatMap((path) => {
@@ -152,6 +155,44 @@ function indexBytes(root: string) {
     git(root, ['rev-parse', '--git-path', 'index']).bytes.toString().trim(),
   );
   return existsSync(path) ? readFileSync(path) : null;
+}
+function repairState(root: string, repair: NonNullable<SnapshotInput['mergeRepair']>) {
+  const key = (path: string) => (process.platform === 'win32' ? path.toLowerCase() : path);
+  const head = git(root, ['rev-parse', '--verify', 'HEAD']).bytes.toString().trim();
+  const mergePath = resolve(
+    root,
+    git(root, ['rev-parse', '--git-path', 'MERGE_HEAD']).bytes.toString().trim(),
+  );
+  const mergeHeads = existsSync(mergePath)
+    ? readFileSync(mergePath, 'utf8').trim().split(/\s+/)
+    : [];
+  const bytes = indexBytes(root),
+    indexFingerprint = bytes ? hash(bytes) : '';
+  if (
+    key(realpathSync(repair.repository)) !== key(root) ||
+    head !== repair.expectedHead ||
+    !mergeHeads.length ||
+    JSON.stringify(mergeHeads) !== JSON.stringify(repair.expectedMergeHeads) ||
+    indexFingerprint !== repair.expectedIndexFingerprint
+  )
+    throw new ProjectError(
+      'SNAPSHOT_REPAIR_CHANGED',
+      '修正现场的目录、HEAD、MERGE_HEAD或真实索引不符，未更新固定版本',
+    );
+  return { head, mergeHeads, indexFingerprint };
+}
+export function retainVersionOriginal(storage: string, sha256: string, bytes: Buffer): void {
+  if (!/^[0-9a-f]{64}$/.test(sha256) || hash(bytes) !== sha256)
+    throw new ProjectError('SNAPSHOT_CORRUPT', '原件哈希不符，未保存');
+  const originalRoot = join(storage, 'sha256');
+  mkdirSync(originalRoot, { recursive: true });
+  checkedDirectory(originalRoot);
+  const path = join(originalRoot, sha256);
+  if (lstatSync(path, { throwIfNoEntry: false })) {
+    safeFile(storage, 'sha256/' + sha256);
+    if (lstatSync(path).size !== bytes.length || hash(readFileSync(path)) !== sha256)
+      throw new ProjectError('SNAPSHOT_CORRUPT', '已存原件哈希不符，未覆盖');
+  } else writeFileSync(path, bytes, { flag: 'wx' });
 }
 function captureFiles(
   root: string,
@@ -208,17 +249,7 @@ function captureFiles(
   if (budget.files > budget.maxFiles || budget.bytes > budget.maxBytes)
     throw new ProjectError('SNAPSHOT_BUDGET', '总范围超出完整快照预算，未裁剪');
   if (persist) {
-    const originalRoot = join(storage, 'sha256');
-    mkdirSync(originalRoot, { recursive: true });
-    checkedDirectory(originalRoot);
-    for (const { file, bytes } of items) {
-      const path = join(originalRoot, file.sha256);
-      if (lstatSync(path, { throwIfNoEntry: false })) {
-        safeFile(storage, 'sha256/' + file.sha256);
-        if (lstatSync(path).size !== file.size || hash(readFileSync(path)) !== file.sha256)
-          throw new ProjectError('SNAPSHOT_CORRUPT', '已存原件哈希不符，未覆盖');
-      } else writeFileSync(path, bytes, { flag: 'wx' });
-    }
+    for (const { file, bytes } of items) retainVersionOriginal(storage, file.sha256, bytes);
   }
   if (
     JSON.stringify(items.map((item) => item.file)) !==
@@ -228,6 +259,7 @@ function captureFiles(
   return {
     root,
     kind: 'files',
+    commonDir: null,
     head: null,
     tree: null,
     ref: null,
@@ -240,11 +272,16 @@ function captureGit(
   excluded: string[],
   budget: { files: number; bytes: number; maxFiles: number; maxBytes: number },
   persist = true,
+  repair?: SnapshotInput['mergeRepair'],
 ): SnapshotRoot {
+  const commonDir = realpathSync(
+    git(root, ['rev-parse', '--path-format=absolute', '--git-common-dir']).bytes.toString().trim(),
+  );
+  const indexState = repair ? repairState(root, repair) : undefined;
   const before = indexBytes(root),
-    items = gitFiles(root, excluded, budget);
+    items = gitFiles(root, excluded, budget, !!repair);
   if (!persist) {
-    const checked = gitFiles(root, excluded, { ...budget, files: 0, bytes: 0 }),
+    const checked = gitFiles(root, excluded, { ...budget, files: 0, bytes: 0 }, !!repair),
       after = indexBytes(root);
     if (
       JSON.stringify(items.map((item) => item.file)) !==
@@ -253,14 +290,17 @@ function captureGit(
       throw new ProjectError('SNAPSHOT_CHANGED', '只读核对期间工作区发生变化');
     if ((before === null) !== (after === null) || (before && after && !before.equals(after)))
       throw new ProjectError('SNAPSHOT_INDEX_CHANGED', '只读核对期间真实暂存区变化');
+    if (repair) repairState(root, repair);
     const head = git(root, ['rev-parse', '--verify', 'HEAD'], { allowFailure: true });
     return {
       root,
       kind: 'git',
+      commonDir,
       head: head.status === 0 ? head.bytes.toString().trim() : null,
       tree: null,
       ref: null,
       files: items.map((item) => item.file),
+      ...(indexState ? { indexState } : {}),
     };
   }
   const directory = mkdtempSync(join(tmpdir(), 'mat-snapshot-index-')),
@@ -309,12 +349,17 @@ function captureGit(
       ),
     });
     const tree = git(root, ['write-tree'], { index }).bytes.toString().trim();
-    const afterItems = gitFiles(root, excluded, {
-      files: 0,
-      bytes: 0,
-      maxFiles: budget.maxFiles,
-      maxBytes: budget.maxBytes,
-    });
+    const afterItems = gitFiles(
+      root,
+      excluded,
+      {
+        files: 0,
+        bytes: 0,
+        maxFiles: budget.maxFiles,
+        maxBytes: budget.maxBytes,
+      },
+      !!repair,
+    );
     if (
       JSON.stringify(items.map((item) => [item.file.path, item.file.sha256, item.file.mode])) !==
       JSON.stringify(afterItems.map((item) => [item.file.path, item.file.sha256, item.file.mode]))
@@ -327,15 +372,18 @@ function captureGit(
         '真实暂存区在采样期间变化，不能宣称前后一致',
       );
     const ref = 'refs/mat/snapshots/' + id;
+    if (repair) repairState(root, repair);
     git(root, ['update-ref', ref, tree]);
     const head = git(root, ['rev-parse', '--verify', 'HEAD'], { allowFailure: true });
     return {
       root,
       kind: 'git',
+      commonDir,
       head: head.status === 0 ? head.bytes.toString().trim() : null,
       tree,
       ref,
       files: items.map((item) => item.file),
+      ...(indexState ? { indexState } : {}),
     };
   } finally {
     if (!within(tmpdir(), directory) || !directory.includes('mat-snapshot-index-'))
@@ -406,9 +454,11 @@ function sampleWorkspace(input: SnapshotInput, persist: boolean): WorkspaceSnaps
     throw new ProjectError('SNAPSHOT_SCOPE', '原件存储不能成为材料输入');
   const codeExcluded = [...excluded, ...materials],
     root = main ?? cwd;
+  if (input.mergeRepair && !main)
+    throw new ProjectError('SNAPSHOT_REPAIR_CHANGED', '修正现场必须是已关联的Git工作区');
   const roots = [
     main
-      ? captureGit(root, id, [...codeExcluded, ...additional], budget, persist)
+      ? captureGit(root, id, [...codeExcluded, ...additional], budget, persist, input.mergeRepair)
       : captureFiles(root, input.storage, [...codeExcluded, ...additional], budget, persist),
     ...additional.map((root) => captureGit(root, id, codeExcluded, budget, persist)),
     ...materials.map((root) =>
@@ -452,13 +502,21 @@ export function readSnapshotFile(
     throw new ProjectError('SNAPSHOT_FILE_MISSING', '该固定版本没有此文件原件');
   const bytes =
     root.kind === 'git' && file.objectId
-      ? git(root.root, ['cat-file', 'blob', file.objectId]).bytes
+      ? git(root.commonDir ?? root.root, ['cat-file', 'blob', file.objectId]).bytes
       : (() => {
-          checkedDirectory(storage);
-          const path = safeFile(storage, 'sha256/' + file.sha256);
-          if (lstatSync(path).size !== file.size)
-            throw new ProjectError('SNAPSHOT_CORRUPT', '固定原件大小或哈希不符');
-          return readFileSync(path);
+          try {
+            checkedDirectory(storage);
+            const path = safeFile(storage, 'sha256/' + file.sha256);
+            if (lstatSync(path).size !== file.size)
+              throw new ProjectError('SNAPSHOT_CORRUPT', '固定原件大小或哈希不符');
+            return readFileSync(path);
+          } catch (error) {
+            if (error instanceof ProjectError) throw error;
+            throw new ProjectError(
+              'SNAPSHOT_FILE_UNAVAILABLE',
+              '固定原件缺失或不可读，未改用实时目录',
+            );
+          }
         })();
   if (hash(bytes) !== file.sha256) throw new ProjectError('SNAPSHOT_CORRUPT', '固定原件哈希不符');
   return bytes;

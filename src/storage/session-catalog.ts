@@ -7,6 +7,7 @@ import { RoleCatalog } from './role-catalog.ts';
 import { sessionInputSchema, sessionSchema } from '../contracts/sessions.ts';
 import type { SessionInput, SessionRecord } from '../contracts/sessions.ts';
 import { ProjectError } from '../services/errors.ts';
+import { captureModelPolicy } from './model-policy-catalog.ts';
 export function migrateSessions(db: DatabaseSync): void {
   db.exec(`CREATE TABLE session(id TEXT PRIMARY KEY,ordinal INTEGER NOT NULL UNIQUE,role_id TEXT NOT NULL REFERENCES role(id),role_type TEXT NOT NULL,role_code TEXT NOT NULL,name TEXT NOT NULL,purpose TEXT NOT NULL,cwd TEXT NOT NULL,configuration TEXT NOT NULL,native_session_id TEXT UNIQUE,status TEXT NOT NULL CHECK(status IN('creating','bound','failed','closed')),error TEXT);
  ALTER TABLE project ADD COLUMN skill_source_root TEXT;
@@ -36,6 +37,9 @@ export class SessionCatalog {
       status: String(row.status),
       error: row.error === null ? null : String(row.error),
       communicationState: String(row.communication_state ?? 'active'),
+      communicationOrigin: row.communication_origin
+        ? JSON.parse(String(row.communication_origin))
+        : null,
       addresses: {
         readable: `${String(row.role_code)}#${Number(row.ordinal)}`,
         numeric: `${String(row.role_id)}#${Number(row.ordinal)}`,
@@ -84,6 +88,7 @@ export class SessionCatalog {
           'UPDATE session SET skill_source_root=(SELECT skill_source_root FROM project WHERE singleton=1) WHERE id=?',
         )
         .run(id);
+      captureModelPolicy(this.db, id, input.configuration ?? role.configuration, role.fallback);
       return this.get(id);
     });
   }
@@ -107,11 +112,17 @@ export class SessionCatalog {
     this.get(id);
     this.db.prepare('UPDATE session SET error=? WHERE id=?').run(error, id);
   }
-  communicationState(id: string, state: SessionRecord['communicationState']): void {
+  communicationState(
+    id: string,
+    state: SessionRecord['communicationState'],
+    origin: SessionRecord['communicationOrigin'] = null,
+  ): void {
     this.get(id);
     if (!['active', 'paused', 'terminated', 'archived'].includes(state))
       throw new ProjectError('INVALID_COMMUNICATION_STATE', '无效的通信门禁状态');
-    this.db.prepare('UPDATE session SET communication_state=? WHERE id=?').run(state, id);
+    this.db
+      .prepare('UPDATE session SET communication_state=?,communication_origin=? WHERE id=?')
+      .run(state, origin ? JSON.stringify(origin) : null, id);
   }
   close(id: string): void {
     this.get(id);

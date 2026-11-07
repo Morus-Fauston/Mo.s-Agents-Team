@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { dirname } from 'node:path';
+import { dirname, relative } from 'node:path';
 import { realpathSync } from 'node:fs';
 import { resolveSkillSources } from '../services/skill-sources.ts';
 import type { SkillSources } from '../services/skill-sources.ts';
@@ -36,7 +36,9 @@ export class SkillAssembly {
     const candidates = Array.isArray(observed) ? observed : observed.candidates;
     return this.sources.entries.map((entry) => {
       const matches = candidates.filter(
-        (candidate) => candidate.name === entry.name && realpathSync(candidate.path) === entry.path,
+        (candidate) =>
+          candidate.name === entry.name &&
+          relative(entry.path, realpathSync(candidate.path)) === '',
       );
       if (matches.length !== 1)
         throw new ProjectError(
@@ -87,7 +89,7 @@ export class SkillAssembly {
     )
       throw new ProjectError('SKILL_DISABLED', '来源禁用此Skill调用');
     const skill = await this.provider.get(entry.candidate, { cwd, signal });
-    if (!skill || skill.name !== name || realpathSync(skill.path) !== entry.path)
+    if (!skill || skill.name !== name || relative(entry.path, realpathSync(skill.path)) !== '')
       throw new ProjectError('SKILL_CHANGED', 'Skill来源发生变化或无法完整加载');
     if (
       (!explicit && !skill.invocation.modelInvocable) ||

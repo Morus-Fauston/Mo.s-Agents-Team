@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { z } from 'zod';
+import { assistantControlInputSchema } from '../contracts/assistant-controls.ts';
 import { ProjectService } from '../services/project-service.ts';
 import { ProjectError } from '../services/project.ts';
 import { initializeSchema } from '../contracts/project.ts';
@@ -16,6 +17,7 @@ import { controlInputSchema } from '../contracts/controls.ts';
 import { createVersionRoutes } from './version-routes.ts';
 import { createReviewRoutes } from './review-routes.ts';
 import { createAcceptanceRoutes } from './acceptance-routes.ts';
+import { createDecisionRequestRoutes } from './decision-request-routes.ts';
 const attachment = z.object({ root: z.string().min(1) }).strict();
 export function createApplication(
   service: ProjectService,
@@ -43,10 +45,19 @@ export function createApplication(
       );
     return c.json({ code: 'OPERATION_FAILED', message: error.message }, 400);
   });
+  app.get('/api/workspace', (c) =>
+    c.json({ root: service.projectRoot ?? null, project: service.list()[0] ?? null }),
+  );
+  app.use('/api/projects/:project/*', async (c, next) => {
+    if (service.projectRoot && c.req.path !== '/api/projects/attach')
+      service.forProject(c.req.param('project')!);
+    await next();
+  });
   app.route('/api/projects', createWorkbenchRoutes(service));
   app.route('/api/projects', createVersionRoutes(service));
   app.route('/api/projects', createReviewRoutes(service, runtime));
   app.route('/api/projects', createAcceptanceRoutes(service, runtime));
+  app.route('/api/projects', createDecisionRequestRoutes(service, runtime));
   app.get('/api/projects/:project/control', (c) => {
     const id = c.req.param('project');
     return c.json(
@@ -85,8 +96,10 @@ export function createApplication(
         ? runtime.controls.query(id, execution)
         : {
             revision: catalog.revision(execution),
-            controls: catalog.list(execution),
+            controls: catalog.publicList(execution),
             jobs: catalog.jobs(execution),
+            assistantTargets: service.forProject(id).assistantControls().forExecution(execution),
+            assistants: service.forProject(id).assistantControls().inventory(execution),
             available: false,
           },
     );
@@ -99,6 +112,53 @@ export function createApplication(
         c.req.param('project'),
         { kind: 'user' },
         { ...input, executionId: z.uuid().parse(c.req.param('execution')) },
+      ),
+      202,
+    );
+  });
+  app.get('/api/projects/:project/executions/:execution/recovery', (c) => {
+    if (!runtime?.controls) throw new ProjectError('HOST_UNAVAILABLE', '宿主未连接恢复核验');
+    return c.json(
+      runtime.controls.recoveryPreview(
+        c.req.param('project'),
+        z.uuid().parse(c.req.param('execution')),
+        z.coerce.number().int().nonnegative().default(0).parse(c.req.query('offset')),
+      ),
+    );
+  });
+  app.get('/api/projects/:project/collaborations/:collaboration/control', (c) => {
+    const connection = service.forProject(c.req.param('project')),
+      id = z.uuid().parse(c.req.param('collaboration'));
+    connection.collaborations().get(id);
+    return c.json({
+      revision: connection.assistantControls().revision(id),
+      controls: connection.assistantControls().list(id),
+    });
+  });
+  app.post('/api/projects/:project/collaborations/:collaboration/control', async (c) => {
+    if (!runtime?.assistantControls)
+      throw new ProjectError('HOST_UNAVAILABLE', '宿主未连接辅助控制');
+    const input = assistantControlInputSchema
+      .omit({ collaborationId: true })
+      .parse(await c.req.json());
+    return c.json(
+      runtime.assistantControls.request(
+        c.req.param('project'),
+        { kind: 'user' },
+        { ...input, collaborationId: z.uuid().parse(c.req.param('collaboration')) },
+      ),
+      202,
+    );
+  });
+  app.post('/api/projects/:project/assistant-controls/:control/retry', async (c) => {
+    if (!runtime?.assistantControls)
+      throw new ProjectError('HOST_UNAVAILABLE', '宿主未连接辅助控制');
+    return c.json(
+      runtime.assistantControls.retry(
+        c.req.param('project'),
+        { kind: 'user' },
+        z.uuid().parse(c.req.param('control')),
+        await c.req.json(),
       ),
       202,
     );
@@ -170,8 +230,48 @@ export function createApplication(
     });
   });
   app.get('/api/projects/:project/sessions', (c) =>
-    c.json(service.forProject(c.req.param('project')).sessions()),
+    c.json(
+      service
+        .forProject(c.req.param('project'))
+        .sessions()
+        .map((session) => ({
+          ...session,
+          collaboration:
+            service
+              .forProject(c.req.param('project'))
+              .collaborations()
+              .currentForSession(session.id) ?? null,
+        })),
+    ),
   );
+  app.get('/api/projects/:project/collaborations', (c) =>
+    c.json(service.forProject(c.req.param('project')).collaborations().list()),
+  );
+  app.get('/api/projects/:project/sessions/:session/log-notices', (c) =>
+    c.json(
+      service
+        .forProject(c.req.param('project'))
+        .workbench()
+        .pendingAssistantLogs(c.req.param('session')),
+    ),
+  );
+  app.get('/api/projects/:project/collaboration-results', (c) => {
+    const connection = service.forProject(c.req.param('project'));
+    return c.json({
+      results: connection.collaborationResults().results(),
+      waits: connection.collaborationResults().waits(),
+    });
+  });
+  app.post('/api/projects/:project/collaboration-waits/:wait/reconcile', async (c) => {
+    z.object({})
+      .strict()
+      .parse(await c.req.json());
+    if (!runtime?.collaborationResults)
+      throw new ProjectError('COLLABORATION_UNAVAILABLE', '协作等待服务尚未装配');
+    return c.json(
+      await runtime.collaborationResults.reconcileWait(c.req.param('project'), c.req.param('wait')),
+    );
+  });
   app.get('/api/projects/:project/executions', (c) => {
     const project = c.req.param('project');
     return c.json(
@@ -230,6 +330,10 @@ export function createApplication(
       session: record,
       defaultConfiguration: connection.roles().find((r) => r.id === record.roleId)!.configuration,
       requestedConfiguration: record.configuration,
+      nativeSelection: null,
+      modelState: connection.modelPolicies().state(session),
+      modelChanges: connection.modelPolicies().history(session),
+      defaultFallback: connection.roles().find((r) => r.id === record.roleId)!.fallback,
       nativeLoaded: false,
       actualPreset: null,
       registeredTools: null,
@@ -237,6 +341,31 @@ export function createApplication(
       message: '仅查询持久记录；未运行的实际配置不推定已生效',
     });
   });
+  app.post('/api/projects/:project/sessions/:session/configuration', async (c) => {
+    if (!runtime?.models)
+      throw new ProjectError('HOST_UNAVAILABLE', '当前宿主未连接原生模型切换服务');
+    return c.json(
+      await runtime.models.explicit(
+        c.req.param('project'),
+        c.req.param('session'),
+        await c.req.json(),
+      ),
+    );
+  });
+  app.post(
+    '/api/projects/:project/sessions/:session/configuration/:change/reconcile',
+    async (c) => {
+      if (!runtime?.models)
+        throw new ProjectError('HOST_UNAVAILABLE', '当前宿主未连接原生模型切换服务');
+      return c.json(
+        await runtime.models.retry(
+          c.req.param('project'),
+          c.req.param('session'),
+          c.req.param('change'),
+        ),
+      );
+    },
+  );
   app.get('/api/projects/:project/contacts', (c) =>
     c.json(
       service

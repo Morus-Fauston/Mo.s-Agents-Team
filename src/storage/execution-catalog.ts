@@ -1,3 +1,4 @@
+import { join, relative } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import {
@@ -27,6 +28,8 @@ import { transaction } from './transaction.ts';
 import type { WorkbenchCatalog, TicketExecutionScope } from './workbench-catalog.ts';
 import type { SessionCatalog } from './session-catalog.ts';
 import type { RoleCatalog } from './role-catalog.ts';
+import type { SessionRecord } from '../contracts/sessions.ts';
+type ReuseObservation = NonNullable<ExecutionRecord['sessionReuse']>['observation'];
 export function migrateExecutions(db: DatabaseSync): void {
   db.exec(`CREATE TABLE execution(id TEXT PRIMARY KEY,dispatch_id TEXT NOT NULL UNIQUE,operation_id TEXT NOT NULL UNIQUE,request_hash TEXT NOT NULL,ticket_id TEXT NOT NULL REFERENCES ticket(id),role_id TEXT NOT NULL REFERENCES role(id),session_id TEXT REFERENCES session(id),current INTEGER NOT NULL DEFAULT 1 CHECK(current IN(0,1)),data TEXT NOT NULL);
  CREATE UNIQUE INDEX execution_current_ticket ON execution(ticket_id) WHERE current=1;
@@ -43,6 +46,29 @@ export class ExecutionCatalog {
   private readonly wb: WorkbenchCatalog;
   private dependencyResolver: ((ticketId: string) => DependencyEvidence | undefined) | undefined;
   private ownerEpoch: string | undefined;
+  private localCommitGuard: ((scopes: string[], mergeId?: string) => void) | undefined;
+  private mergeGuard:
+    | ((
+        actor: WorkbenchActor,
+        input: {
+          mergeId?: string | undefined;
+          ticket: string;
+          roleType: ExecutionRecord['roleType'];
+          cwd: string;
+          writeScopes: string[];
+          additionalRepositories: string[];
+          worktreeId?: string | undefined;
+        },
+      ) => void)
+    | undefined;
+  private mergeLink: ((execution: ExecutionRecord) => void) | undefined;
+  bindMergeContext(
+    guard: NonNullable<ExecutionCatalog['mergeGuard']>,
+    link: NonNullable<ExecutionCatalog['mergeLink']>,
+  ) {
+    this.mergeGuard = guard;
+    this.mergeLink = link;
+  }
   constructor(
     db: DatabaseSync,
     sessions: SessionCatalog,
@@ -56,6 +82,23 @@ export class ExecutionCatalog {
   }
   bindDependencyEvidence(resolve: (id: string) => DependencyEvidence | undefined): void {
     this.dependencyResolver = resolve;
+  }
+  resolveDependencies(ids: string[]): DependencyEvidence[] {
+    return ids.map((id) => {
+      const evidence = this.dependencyResolver?.(id);
+      if (
+        !evidence ||
+        evidence.ticketId !== id ||
+        !evidence.deliveryId ||
+        !evidence.reviewId ||
+        !evidence.scope
+      )
+        throw new ProjectError(
+          'DEPENDENCY_NOT_READY',
+          '直接依赖尚无对应已审版本依据，不接受正文自报完成',
+        );
+      return evidence;
+    });
   }
   private manager(actor: WorkbenchActor): RecordAuthor {
     if (actor.kind !== 'session')
@@ -79,6 +122,9 @@ export class ExecutionCatalog {
       .all()
       .map((row) => this.get(String(row.id)));
   }
+  bindLocalCommitGuard(guard: (scopes: string[], mergeId?: string) => void): void {
+    this.localCommitGuard = guard;
+  }
   currentForSession(sessionId: string): ExecutionRecord | undefined {
     const row = this.db
       .prepare('SELECT id FROM execution WHERE session_id=? AND current=1')
@@ -93,6 +139,13 @@ export class ExecutionCatalog {
       executionId: value.id,
       kind: 'main',
       checklistIds: [],
+      allowAssist:
+        value.writeOccupancy === 'held' &&
+        value.goalId !== null &&
+        (value.lifecycleState === 'active' ||
+          (value.lifecycleState === 'waiting' && value.waitingReviewId === null)) &&
+        value.failure === null &&
+        value.hostEpoch === this.ownerEpoch,
       allowWrite:
         value.goalId !== null &&
         value.lifecycleState === 'active' &&
@@ -137,7 +190,8 @@ export class ExecutionCatalog {
       }),
     );
   }
-  private conflicts(scopes: string[], exclude?: string): void {
+  private conflicts(scopes: string[], exclude?: string, mergeId?: string): void {
+    this.localCommitGuard?.(scopes, mergeId);
     for (const value of this.list())
       if (
         value.id !== exclude &&
@@ -154,6 +208,10 @@ export class ExecutionCatalog {
     raw: unknown,
     hostEpoch: string,
     externalGuard?: (scopes: string[]) => void,
+    observeReuse?: (
+      session: SessionRecord,
+      previous: ExecutionRecord,
+    ) => ReuseObservation | undefined,
   ): { record: ExecutionRecord; isNew: boolean } {
     this.ownerEpoch ??= hostEpoch;
     const input = dispatchInputSchema.parse(raw),
@@ -190,22 +248,7 @@ export class ExecutionCatalog {
         throw new ProjectError('PRIMARY_EXECUTION_EXISTS', '本票已有活跃主执行，不能重复安排');
       if (ticket.state !== 'todo')
         throw new ProjectError('TICKET_NOT_TODO', '当前票据状态不能新派工，请沿实际办理处理');
-      const dependencyEvidence: DependencyEvidence[] = [];
-      for (const id of ticket.dependencies) {
-        const evidence = this.dependencyResolver?.(id);
-        if (
-          !evidence ||
-          evidence.ticketId !== id ||
-          !evidence.deliveryId ||
-          !evidence.reviewId ||
-          !evidence.scope
-        )
-          throw new ProjectError(
-            'DEPENDENCY_NOT_READY',
-            '直接依赖尚无对应已审版本依据，不接受正文自报完成',
-          );
-        dependencyEvidence.push(evidence);
-      }
+      const dependencyEvidence = this.resolveDependencies(ticket.dependencies);
       const session = input.sessionId ? this.sessions.get(input.sessionId) : undefined;
       const role = session
         ? this.roles.list().find((role) => role.id === session.roleId)
@@ -213,6 +256,11 @@ export class ExecutionCatalog {
             .list()
             .find((role) => role.id === input.roleId || role.aliases.includes(input.roleId!));
       if (!role) throw new ProjectError('ROLE_NOT_FOUND', '目标角色未在项目登记');
+      if (ticket.kind === 'research' && role.type !== 'investigator')
+        throw new ProjectError(
+          'RESEARCH_INVESTIGATOR_REQUIRED',
+          '研究票的正式主执行必须是调查角色',
+        );
       if (role.type === 'supervisor')
         throw new ProjectError(
           'INVALID_EXECUTOR_TYPE',
@@ -221,14 +269,35 @@ export class ExecutionCatalog {
       if (
         session &&
         (session.status !== 'bound' ||
-          session.communicationState !== 'active' ||
+          (!input.reuseClosedExecutionId && session.communicationState !== 'active') ||
           session.error !== null)
       )
         throw new ProjectError(
           'SESSION_UNAVAILABLE',
           '目标会话未准备、受控制或异常，不能因派工复活',
         );
-      if (session && this.currentForSession(session.id))
+      if (
+        session &&
+        (this.currentForSession(session.id) ||
+          this.db
+            .prepare("SELECT id FROM collaboration WHERE session_id=? AND state!='completed'")
+            .get(session.id) ||
+          this.db
+            .prepare(
+              "SELECT id FROM local_commit_arrangement WHERE session_id=? AND json_extract(data,'$.status') NOT IN('completed','cancelled')",
+            )
+            .get(session.id) ||
+          this.db
+            .prepare(
+              "SELECT id FROM worktree_merge WHERE session_id=? AND json_extract(data,'$.status') NOT IN('completed','cancelled')",
+            )
+            .get(session.id) ||
+          this.db
+            .prepare(
+              "SELECT id FROM review WHERE json_extract(data,'$.sessionId')=? AND (json_extract(data,'$.status') NOT IN('decided','cancelled') OR COALESCE(json_extract(data,'$.closure.state'),'')!='confirmed')",
+            )
+            .get(session.id))
+      )
         throw new ProjectError(
           'SESSION_EXECUTION_BUSY',
           '同一会话已有本票或另一票责任，不能并行承接',
@@ -253,8 +322,73 @@ export class ExecutionCatalog {
         for (const scope of scopes)
           if (!withinPath(cwd, scope))
             throw new ProjectError('WRITE_SCOPE_OUTSIDE_CWD', '协调写入范围超出本次源码工作目录');
-      this.conflicts(scopes);
+      if (input.mergeId && !this.mergeGuard)
+        throw new ProjectError(
+          'MERGE_DISPATCH_UNAVAILABLE',
+          '原合入交接核对缺件，不以正文id授范围例外',
+        );
+      this.mergeGuard?.(actor, {
+        mergeId: input.mergeId,
+        ticket: ticket.id,
+        roleType: role.type,
+        cwd,
+        writeScopes: scopes,
+        additionalRepositories: input.additionalRepositories,
+        worktreeId: input.worktreeId,
+      });
+      this.conflicts(scopes, undefined, input.mergeId);
       externalGuard?.(scopes);
+      let sessionReuse: ExecutionRecord['sessionReuse'] = null;
+      if (input.reuseClosedExecutionId && session) {
+        const origin = session.communicationOrigin;
+        if (
+          session.communicationState !== 'paused' ||
+          origin?.executionId !== input.reuseClosedExecutionId
+        )
+          throw new ProjectError(
+            'SESSION_REUSE_ORIGIN_MISMATCH',
+            '原会话暂停来源不是指定的审阅收尾，不能解除',
+          );
+        const previous = this.get(origin.executionId);
+        if (
+          previous.sessionId !== session.id ||
+          previous.nativeSessionId !== session.nativeSessionId ||
+          previous.ticketId === ticket.id ||
+          previous.lifecycleState !== 'closed' ||
+          previous.writeOccupancy !== 'released' ||
+          previous.reviewResultId !== origin.resultId ||
+          !previous.goalId
+        )
+          throw new ProjectError(
+            'SESSION_REUSE_ORIGIN_MISMATCH',
+            '原收尾身份或释放依据不匹配，不能接下一票',
+          );
+        if (!input.writeScopes)
+          throw new ProjectError(
+            'SESSION_REUSE_SCOPE_REQUIRED',
+            '顺序承票须明确声明下一票写入范围；只读填空数组',
+          );
+        const observation = observeReuse?.(session, previous);
+        if (
+          !observation ||
+          !session.nativeSessionId ||
+          observation.state !== 'confirmed' ||
+          observation.nativeSessionId !== session.nativeSessionId ||
+          observation.epoch !== hostEpoch ||
+          observation.ranges.some(
+            (range) => range.state !== 'gone' || range.nativeOwner !== session.nativeSessionId,
+          )
+        )
+          throw new ProjectError(
+            'SESSION_REUSE_NOT_QUIET',
+            '原生会话未确认停稳，不能接下一票。' + (observation?.note ?? ''),
+          );
+        sessionReuse = {
+          previousExecutionId: previous.id,
+          previousResultId: origin.resultId,
+          observation,
+        };
+      }
       const value: ExecutionRecord = {
         id: randomUUID(),
         dispatchId: randomUUID(),
@@ -270,8 +404,11 @@ export class ExecutionCatalog {
         name: input.name,
         requirements: input.requirements,
         cwd,
+        worktreeId: input.worktreeId ?? null,
+        mergeId: input.mergeId ?? null,
         cwdMode: input.cwd ? 'explicit' : 'preserve-current',
         writeScopes: scopes,
+        scopeAdjustments: [],
         additionalRepositories: input.additionalRepositories,
         writeScopesDefaulted: input.writeScopes === undefined,
         requestedConfiguration: input.configuration ?? (session ? null : role.configuration),
@@ -288,6 +425,7 @@ export class ExecutionCatalog {
         lifecycleState: 'active',
         waitingReviewId: null,
         reviewResultId: null,
+        sessionReuse,
         writeOccupancy: 'held',
         goalId: null,
         goalObjective: null,
@@ -322,9 +460,13 @@ export class ExecutionCatalog {
       this.db
         .prepare('UPDATE ticket SET data=? WHERE id=?')
         .run(JSON.stringify({ ...ticket, currentExecution: value.id }), ticket.id);
+      this.mergeLink?.(value);
+      if (sessionReuse && session) this.sessions.communicationState(session.id, 'active');
       this.event(value, 'registered', 'registered', {
         actor: author,
         ticketRevision: ticket.revision,
+        dependencyEvidence,
+        ...(sessionReuse ? { sessionReuse } : {}),
       });
       this.history(value, 'dispatch-registered', '主管登记单票派工；尚未确认启动');
       return { record: value, isNew: true };
@@ -382,10 +524,74 @@ export class ExecutionCatalog {
       for (const scope of scopes)
         if (!withinPath(canonical, scope))
           throw new ProjectError('WRITE_SCOPE_OUTSIDE_CWD', '实际目录与声明写域不一致');
-      this.conflicts(scopes, id);
+      this.conflicts(scopes, id, value.mergeId ?? undefined);
       externalGuard?.(scopes);
       value.cwd = canonical;
       value.writeScopes = scopes;
+    });
+  }
+  guardExistingScope(id: string, scopes: string[], linkedMergeId?: string): void {
+    this.conflicts(scopes, id, linkedMergeId);
+  }
+  linkStartupWorktree(id: string, worktreeId: string) {
+    return this.change(id, (value) => {
+      if (value.worktreeId === worktreeId) return;
+      if (
+        value.worktreeId ||
+        value.goalId ||
+        value.firstRequestId ||
+        !['registered', 'creating-session', 'session-prepared'].includes(value.startupState)
+      )
+        throw new ProjectError('WORKTREE_BINDING_CHANGED', '仅在本次启动基线前关联实际已有工作树');
+      value.worktreeId = worktreeId;
+      this.event(value, 'worktree-link:' + worktreeId, 'worktree-linked', {
+        worktreeId,
+        cwd: value.cwd,
+      });
+    });
+  }
+  worktreeEntered(
+    id: string,
+    worktreeId: string,
+    sourceRepository: string,
+    path: string,
+    originalCwd: string,
+    cwd: string,
+  ): ExecutionRecord {
+    return this.change(id, (value) => {
+      const desired = canonicalDirectory(cwd);
+      if (value.worktreeId === worktreeId && value.cwd === desired) return;
+      if (
+        value.cwd !== canonicalDirectory(originalCwd) ||
+        value.mergeId ||
+        value.worktreeId ||
+        !['active', 'paused'].includes(value.lifecycleState) ||
+        value.waitingReviewId
+      )
+        throw new ProjectError(
+          'WORKTREE_EXECUTION_CHANGED',
+          '原执行目录或责任已变化，不覆盖新状态',
+        );
+      if (!withinPath(path, desired) || !withinPath(sourceRepository, value.cwd))
+        throw new ProjectError('WORKTREE_CWD_SCOPE', '新目录不对应原源码空间');
+      const scopes = value.writeScopesDefaulted
+        ? [desired]
+        : value.writeScopes.map((scope) => {
+            if (!withinPath(sourceRepository, scope))
+              throw new ProjectError('WORKTREE_WRITE_SCOPE', '原写域不在原源码仓库，不自动扩围');
+            return canonicalWriteScope(join(path, relative(sourceRepository, scope)));
+          });
+      this.conflicts(scopes, id);
+      value.cwd = desired;
+      value.cwdMode = 'explicit';
+      value.writeScopes = scopes;
+      value.worktreeId = worktreeId;
+      this.event(value, 'worktree:' + worktreeId, 'worktree-entered', {
+        worktreeId,
+        originalCwd,
+        cwd: desired,
+        writeScopes: scopes,
+      });
     });
   }
   starting(
@@ -450,6 +656,23 @@ export class ExecutionCatalog {
       this.event(value, 'review-wait:' + reviewId, 'review-wait', { reviewId });
     });
   }
+  waitForCollaborations(id: string): ExecutionRecord {
+    return this.change(id, (v) => {
+      if (v.lifecycleState !== 'active' || v.failure)
+        throw new ProjectError('EXECUTION_CANNOT_WAIT', '当前执行不能进入协作等待');
+      v.lifecycleState = 'waiting';
+      v.waitingReviewId = null;
+      this.event(v, 'collaboration-wait:' + randomUUID(), 'collaboration-wait', {});
+    });
+  }
+  returnFromCollaborationWait(id: string): ExecutionRecord {
+    return this.change(id, (v) => {
+      if (v.lifecycleState !== 'waiting' || v.waitingReviewId !== null || v.failure)
+        throw new ProjectError('COLLABORATION_WAIT_CHANGED', '原执行已不在普通协作等待');
+      v.lifecycleState = 'active';
+      this.event(v, 'collaboration-resume:' + randomUUID(), 'collaboration-resume', {});
+    });
+  }
   returnFromReview(id: string, reviewId: string, resultId: string, epoch: string): ExecutionRecord {
     return transaction(this.db, () =>
       this.change(id, (value) => {
@@ -485,7 +708,13 @@ export class ExecutionCatalog {
         value.reviewResultId = resultId;
         value.lifecycleState = 'closed';
         value.writeOccupancy = 'released';
-        if (value.sessionId) this.sessions.communicationState(value.sessionId, 'paused');
+        if (value.sessionId)
+          this.sessions.communicationState(value.sessionId, 'paused', {
+            kind: 'execution-closed',
+            executionId: value.id,
+            resultId,
+            at: now(),
+          });
         this.event(value, 'review-close:' + resultId, 'review-close', { reviewId, resultId });
       });
       this.db.prepare('UPDATE execution SET current=0 WHERE id=?').run(id);
@@ -657,11 +886,12 @@ export class ExecutionCatalog {
       });
     this.fail(current.id, {
       code: input.code,
-      message: '执行宿主报告独立异常，原始错误见关联DSH会话；未自动换模或重派',
+      message:
+        '执行宿主报告独立异常，原始错误见关联DSH会话；模型选择和实际请求另查配置记录，未盲目重派',
       unknown: false,
     });
   }
-  turnEnded(sessionId: string, event: NativeEvent): void {
+  turnEnded(sessionId: string, event: NativeEvent, modelChangeId?: string): void {
     const current = this.currentForSession(sessionId);
     if (!current || event.type !== 'turn/end') return;
     const reason = event.data.reason as { kind?: string; error?: { code?: string } } | undefined;
@@ -675,9 +905,32 @@ export class ExecutionCatalog {
         last.failed = true;
         this.saveStep(current.id, last);
       });
+    if (modelChangeId) {
+      const row = this.db
+        .prepare('SELECT data FROM model_change WHERE id=? AND session_id=?')
+        .get(modelChangeId, sessionId);
+      const change = row ? JSON.parse(String(row.data)) : null;
+      if (
+        change?.source === 'fallback' &&
+        change.failureId === String(turn) + ':' + String(last?.step ?? 0) &&
+        change.failureCode === reason.error?.code &&
+        ['reserved', 'confirmed', 'unknown'].includes(change.status)
+      ) {
+        this.change(current.id, (value) => {
+          this.event(value, 'model-recovery:' + modelChangeId + ':' + event.seq, 'model-recovery', {
+            modelChangeId,
+            turn,
+            code: reason.error?.code,
+            note: '原模型失败步骤仍保留；仅此原错误正在按已捕获单一备用策略接续，不将整次执行提前标为终止故障',
+          });
+        });
+        return;
+      }
+    }
     this.fail(current.id, {
       code: reason.error?.code ?? 'NATIVE_TURN_ERROR',
-      message: '执行宿主异常结束，原始错误见关联DSH会话；未自动换模或重派',
+      message:
+        '执行宿主异常结束，原始错误见关联DSH会话；模型选择和实际请求另查配置记录，未盲目重派',
       unknown: false,
     });
   }

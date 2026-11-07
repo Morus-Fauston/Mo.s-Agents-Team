@@ -6,7 +6,9 @@ import { z } from 'zod';
 import { matchesMessage, presentMessage, messageIdentity } from './message-presentation.ts';
 import { checkReferences } from './file-references.ts';
 import { ProjectError } from './errors.ts';
+import { unstartedInput } from '../host/unstarted-input.ts';
 export interface MessageHost {
+  peek?(projectId: string, sessionId: string): NativeAgent | undefined;
   open(projectId: string, sessionId: string): Promise<NativeAgent>;
   flush(agent: NativeAgent): Promise<boolean>;
 }
@@ -23,8 +25,35 @@ export class CommunicationService {
   async send(projectId: string, actor: ChatActor, input: ChatInput): Promise<SavedMessage> {
     if (this.closed) throw new ProjectError('COMMUNICATION_CLOSED', '通信服务正在关闭');
     const connection = this.projects.forProject(projectId);
+    if (
+      input.allowedChecklistIds !== undefined &&
+      (actor.kind !== 'session' || input.target === 'user')
+    )
+      throw new ProjectError(
+        'CHECKLIST_GRANT_SOURCE',
+        '指定Checklist授权必须由原主负责人向当前辅助发送',
+      );
     const references = checkReferences(connection, actor, input.target, input.references ?? []);
-    const saved = connection.messages().save(actor, { ...input, references });
+    let existing = false;
+    try {
+      connection.messages().get(input.id);
+      existing = true;
+    } catch (error) {
+      if (!(error instanceof ProjectError) || error.code !== 'MESSAGE_NOT_FOUND') throw error;
+    }
+    const save = () => connection.messages().save(actor, { ...input, references });
+    const saved =
+      !existing && actor.kind === 'session' && input.target !== 'user'
+        ? connection
+            .collaborations()
+            .chat(
+              actor.sessionId,
+              connection.messages().resolveTarget(input.target).id,
+              input.id,
+              input.allowedChecklistIds,
+              save,
+            )
+        : save();
     if (saved.receipt.targetSessionId !== null)
       await this.enqueue(projectId, saved.receipt.targetSessionId, saved.message.id);
     return connection.messages().get(saved.message.id);
@@ -49,12 +78,122 @@ export class CommunicationService {
     await this.enqueue(projectId, saved.receipt.targetSessionId!, saved.message.id);
     return catalog.get(saved.message.id);
   }
+  async sendMergeNotice(project: string, id: string, notice: string): Promise<SavedMessage> {
+    if (this.closed) throw new ProjectError('COMMUNICATION_CLOSED', '通信服务正在关闭');
+    const catalog = this.projects.forProject(project).messages(),
+      saved = catalog.saveMergeNotice(id, notice);
+    await this.enqueue(project, saved.receipt.targetSessionId!, saved.message.id);
+    return catalog.get(saved.message.id);
+  }
+  async sendLocalCommitNotice(project: string, id: string, notice: string): Promise<SavedMessage> {
+    if (this.closed) throw new ProjectError('COMMUNICATION_CLOSED', '通信服务正在关闭');
+    const catalog = this.projects.forProject(project).messages(),
+      saved = catalog.saveLocalCommitNotice(id, notice);
+    await this.enqueue(project, saved.receipt.targetSessionId!, saved.message.id);
+    return catalog.get(saved.message.id);
+  }
+  async sendCollaborationResult(projectId: string, id: string): Promise<SavedMessage> {
+    if (this.closed) throw new ProjectError('COMMUNICATION_CLOSED', '通信服务正在关闭');
+    const connection = this.projects.forProject(projectId),
+      notice = connection.collaborationResults().prepareNotice(id),
+      saved = connection.messages().saveCollaborationResult(id, notice.id);
+    await this.enqueue(projectId, notice.targetSessionId, saved.message.id);
+    return connection.messages().get(saved.message.id);
+  }
+  async stageCollaborationResult(projectId: string, id: string): Promise<SavedMessage> {
+    if (this.closed) throw new ProjectError('COMMUNICATION_CLOSED', '通信服务正在关闭');
+    const c = this.projects.forProject(projectId),
+      notice = c.collaborationResults().prepareNotice(id),
+      catalog = c.messages();
+    catalog.saveCollaborationResult(id, notice.id);
+    return this.stageSaved(projectId, notice.id);
+  }
+  async stageCollaborationFault(projectId: string, id: string): Promise<SavedMessage> {
+    this.projects.forProject(projectId).messages().saveCollaborationFault(id);
+    return this.stageSaved(projectId, id);
+  }
+  async sendAssistantControl(
+    projectId: string,
+    id: string,
+    kind: 'request' | 'resume',
+  ): Promise<SavedMessage> {
+    const c = this.projects.forProject(projectId),
+      saved = c.messages().saveAssistantControl(id, kind);
+    await this.enqueue(projectId, saved.receipt.targetSessionId!, saved.message.id);
+    return c.messages().get(saved.message.id);
+  }
+  async stageAssistantControl(
+    projectId: string,
+    id: string,
+    kind: 'request' | 'resume',
+  ): Promise<SavedMessage> {
+    const saved = this.projects.forProject(projectId).messages().saveAssistantControl(id, kind);
+    return this.stageSaved(projectId, saved.message.id);
+  }
+  async sendCollaborationFault(projectId: string, id: string): Promise<SavedMessage> {
+    const catalog = this.projects.forProject(projectId).messages(),
+      saved = catalog.saveCollaborationFault(id);
+    await this.enqueue(projectId, saved.receipt.targetSessionId!, id);
+    return catalog.get(id);
+  }
+  private async stageSaved(projectId: string, id: string): Promise<SavedMessage> {
+    if (this.closed) throw new ProjectError('COMMUNICATION_CLOSED', '通信服务正在关闭');
+    const c = this.projects.forProject(projectId),
+      catalog = c.messages();
+    const saved = catalog.beginDelivery(id),
+      targetSessionId = saved.receipt.targetSessionId!;
+    if (saved.receipt.state !== 'sending') return saved;
+    try {
+      const target = this.host.peek?.(projectId, targetSessionId);
+      if (!target || target.id !== c.session(targetSessionId).nativeSessionId)
+        throw new ProjectError(
+          'COLLABORATION_TARGET_NOT_LOADED',
+          '原主会话未加载或身份不符，不另开替代',
+        );
+      const native = presentMessage(saved),
+        existing = [...target.session.deriveMessages(), ...target.inbox.nextStep].find(
+          (m) => m.id === native.id,
+        );
+      if (existing) {
+        if (!matchesMessage(existing, saved))
+          throw new ProjectError('NATIVE_MESSAGE_CONFLICT', '原正式结果输入内容不一致');
+      } else {
+        if (saved.receipt.memoryAcceptedAt !== null)
+          throw new ProjectError(
+            'NATIVE_MESSAGE_UNCONFIRMED',
+            '原结果曾接纳但无法定位，不盲目重投',
+          );
+        target.inject(native);
+      }
+      catalog.recordMemoryAccepted(id);
+      if (!(await this.host.flush(target)))
+        throw new ProjectError('DURABILITY_UNCONFIRMED', '正式结果输入尚未确认持久接纳');
+      catalog.recordDurableAccepted(id);
+    } catch (error) {
+      catalog.recordFailure(
+        id,
+        error instanceof Error ? error.message : '正式结果输入持久接纳未知',
+      );
+    }
+    return catalog.get(id);
+  }
   async sendAcceptanceNotice(projectId: string, id: string): Promise<SavedMessage> {
     if (this.closed) throw new ProjectError('COMMUNICATION_CLOSED', '通信服务正在关闭');
     const catalog = this.projects.forProject(projectId).messages(),
       saved = catalog.saveAcceptanceNotice(id);
     await this.enqueue(projectId, saved.receipt.targetSessionId!, saved.message.id);
     return catalog.get(saved.message.id);
+  }
+  async stageDecisionNotice(projectId: string, id: string): Promise<SavedMessage> {
+    const saved = this.projects.forProject(projectId).messages().saveDecisionNotice(id);
+    return saved.receipt.targetSessionId === null ? saved : this.stageSaved(projectId, id);
+  }
+  async sendDecisionNotice(projectId: string, id: string): Promise<SavedMessage> {
+    const catalog = this.projects.forProject(projectId).messages(),
+      saved = catalog.saveDecisionNotice(id);
+    if (saved.receipt.targetSessionId !== null)
+      await this.enqueue(projectId, saved.receipt.targetSessionId, id);
+    return catalog.get(id);
   }
   async sendReviewResult(
     projectId: string,
@@ -109,7 +248,10 @@ export class CommunicationService {
                 '原文已在历史但进入请求回执未核对，不重放未知输入',
               );
           } else {
-            if (saved.receipt.memoryAcceptedAt !== null)
+            if (
+              saved.receipt.memoryAcceptedAt !== null &&
+              !unstartedInput(agent.session.snapshotEvents(), message)
+            )
               throw new ProjectError(
                 'NATIVE_MESSAGE_UNCONFIRMED',
                 '原输入曾接纳却无法定位，恢复暂停核对',
@@ -295,6 +437,7 @@ export class CommunicationService {
         const saved = catalog.get(input.id);
         if (saved.receipt.targetSessionId !== sessionId || !matchesMessage(input, saved))
           throw new ProjectError('MESSAGE_SOURCE_MISMATCH', '输入消息与当前真实收件入口不一致');
+        if (catalog.holdObsoleteDecisionNotice(input.id)) continue;
         origin ??= saved.message.id;
         messages.push(input);
         if (saved.message.sender.kind === 'user')

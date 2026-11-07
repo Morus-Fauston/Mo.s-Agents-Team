@@ -73,6 +73,12 @@ export class CompletionService {
     const connection = this.projects.forProject(project),
       catalog = connection.reviews(),
       input = deliveryVersionInputSchema.parse(raw);
+    const current = connection.executions().currentForSession(sessionId);
+    if (current && connection.collaborationResults().unsettled(current.id).length)
+      throw new ProjectError(
+        'ASSISTANTS_UNSETTLED',
+        '本次辅助尚未全部交回并停稳，不能固定整票交付',
+      );
     if (
       this.host.peek(project, sessionId) !== agent ||
       connection.session(sessionId).nativeSessionId !== agent.id
@@ -503,7 +509,9 @@ export class CompletionService {
         this.goals().pause(agent, { id: goal.id, revision: goal.revision });
       const control = connection.controls().activeControl(review.executionId),
         hard =
-          control?.stopMode === 'hard' ||
+          (control !== undefined &&
+            ['hard-stop', 'terminate'].includes(control.action) &&
+            control.stopMode === 'hard') ||
           connection.controls().project().state === 'forced-stopped';
       if (hard) {
         original();
@@ -561,7 +569,37 @@ export class CompletionService {
         executionId: review.executionId,
         versionId: version.id,
         fingerprint: version.snapshot.fingerprint,
-        ticket: version.ticket,
+        ticket:
+          version.ticket.kind === 'research'
+            ? {
+                ...version.ticket,
+                research: {
+                  bodyLoaded: false,
+                  questionIds: version.ticket.research?.questions.map((q) => q.id) ?? [],
+                  readTool:
+                    'mat_ticket section=research，versionId=' +
+                    version.id +
+                    '；questionId逐题读取此固定版本定义和回答',
+                },
+              }
+            : version.ticket,
+        ...(version.ticket.kind === 'research'
+          ? {
+              research: {
+                reportCount: version.reportPaths.length,
+                answerRevisions: version.researchAnswers.map((a) => ({
+                  questionId: a.questionId,
+                  answerRevision: a.revision,
+                  questionRevision: a.questionRevision,
+                  status: a.status,
+                })),
+                readTool: 'mat_ticket section=research，versionId=' + version.id,
+                reportTool:
+                  'mat_version action=detail读取snapshot目录，action=file指定versionId/rootIndex/path读取固定报告，按nextOffset读完；不得以当前可变文件替代',
+                warning: '当前票据/回答不替代固定送审版本；报告、审阅、建议采纳与运行验证分开判断',
+              },
+            }
+          : {}),
         executionRequirements: connection.executions().get(review.executionId).requirements,
         supplementalAttempt:
           connection

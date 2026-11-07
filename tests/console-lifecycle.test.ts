@@ -32,7 +32,9 @@ function assertReleased(root: string) {
 }
 test('同步启动参数失败不留下项目独占连接', async () => {
   const f = fixture();
-  await expect(startConsole({ stateDirectory: f.state, port: -1 })).rejects.toThrow();
+  await expect(
+    startConsole({ stateDirectory: f.state, projectRoot: f.root, port: -1 }),
+  ).rejects.toThrow();
   assertReleased(f.root);
 });
 test('异步端口占用失败释放已恢复的项目连接', async () => {
@@ -43,7 +45,7 @@ test('异步端口占用失败释放已恢复的项目连接', async () => {
     const address = occupied.address();
     if (!address || typeof address === 'string') throw new Error('未取得端口');
     await expect(
-      startConsole({ stateDirectory: f.state, port: address.port }),
+      startConsole({ stateDirectory: f.state, projectRoot: f.root, port: address.port }),
     ).rejects.toMatchObject({ code: 'EADDRINUSE' });
     assertReleased(f.root);
   } finally {
@@ -53,10 +55,12 @@ test('异步端口占用失败释放已恢复的项目连接', async () => {
 test('连接文件写入失败同时关闭HTTP与数据库，正常关闭可重复调用', async () => {
   const f = fixture();
   mkdirSync(join(f.state, '连接.json'));
-  await expect(startConsole({ stateDirectory: f.state, port: 0 })).rejects.toThrow();
+  await expect(
+    startConsole({ stateDirectory: f.state, projectRoot: f.root, port: 0 }),
+  ).rejects.toThrow();
   assertReleased(f.root);
   rmSync(join(f.state, '连接.json'), { recursive: true });
-  const server = await startConsole({ stateDirectory: f.state, port: 0 });
+  const server = await startConsole({ stateDirectory: f.state, projectRoot: f.root, port: 0 });
   expect((await fetch(server.url + '/api/projects')).status).toBe(200);
   await server.close();
   await server.close();

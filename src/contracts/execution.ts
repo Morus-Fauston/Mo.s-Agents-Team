@@ -1,15 +1,32 @@
 import { z } from 'zod';
 import { executionConfigurationSchema } from './project.ts';
 import { authorSchema } from './workbench.ts';
+import { localCommitNativeSchema, localCommitQuiescenceSchema } from './local-commits.ts';
+export const scopeAdjustmentBodySchema = z
+  .object({
+    executionId: z.uuid(),
+    expectedControlRevision: z.number().int().positive(),
+    expectedScopeRevision: z.number().int().nonnegative(),
+    writeScopes: z.array(z.string().min(1)).max(128),
+    reason: z.string().trim().min(1).max(10000),
+    decisionRequestId: z.uuid().optional(),
+  })
+  .strict();
+export const scopeAdjustmentInputSchema = scopeAdjustmentBodySchema.extend({
+  operationId: z.uuid(),
+});
 export const dispatchBodySchema = z
   .object({
     ticket: z.string().min(1),
     roleId: z.string().min(1).optional(),
     sessionId: z.uuid().optional(),
+    reuseClosedExecutionId: z.uuid().optional(),
     name: z.string().trim().min(1).max(160),
     cwd: z.string().min(1).optional(),
     writeScopes: z.array(z.string().min(1)).optional(),
     additionalRepositories: z.array(z.string().min(1)).max(16).default([]),
+    worktreeId: z.uuid().optional(),
+    mergeId: z.uuid().optional(),
     requirements: z.string().default(''),
     configuration: executionConfigurationSchema.optional(),
     notifySessionId: z.uuid().optional(),
@@ -21,8 +38,10 @@ export const dispatchInputSchema = dispatchBodySchema
   .superRefine((input, ctx) => {
     if ((input.roleId === undefined) === (input.sessionId === undefined))
       ctx.addIssue({ code: 'custom', message: '每次选择一个新开角色或一个明确已有会话' });
-    if (input.roleId && !input.cwd)
+    if (input.roleId && !input.cwd && !input.worktreeId)
       ctx.addIssue({ code: 'custom', message: '新会话须明确源码工作目录' });
+    if (input.reuseClosedExecutionId && !input.sessionId)
+      ctx.addIssue({ code: 'custom', message: '顺序承票须明确指定已收尾的原会话' });
   });
 export const nativeGoalSchema = z.object({
   id: z.string(),
@@ -66,8 +85,27 @@ export const executionSchema = z.object({
   name: z.string(),
   requirements: z.string(),
   cwd: z.string(),
+  worktreeId: z.uuid().nullable().default(null),
+  mergeId: z.uuid().nullable().default(null),
   cwdMode: z.enum(['explicit', 'preserve-current']),
   writeScopes: z.array(z.string()),
+  scopeAdjustments: z
+    .array(
+      z.object({
+        operationId: z.uuid(),
+        requestHash: z.string(),
+        revision: z.number().int().positive(),
+        stoppedControlId: z.uuid(),
+        controlRevision: z.number().int().positive(),
+        before: z.array(z.string()),
+        after: z.array(z.string()),
+        actor: authorSchema,
+        reason: z.string(),
+        decisionRequestId: z.uuid().nullable(),
+        at: z.string(),
+      }),
+    )
+    .default([]),
   additionalRepositories: z.array(z.string()).default([]),
   writeScopesDefaulted: z.boolean(),
   requestedConfiguration: executionConfigurationSchema.nullable(),
@@ -88,6 +126,14 @@ export const executionSchema = z.object({
   lifecycleState: z.enum(['active', 'waiting', 'paused', 'error', 'terminated', 'closed']),
   waitingReviewId: z.uuid().nullable().default(null),
   reviewResultId: z.uuid().nullable().default(null),
+  sessionReuse: z
+    .object({
+      previousExecutionId: z.uuid(),
+      previousResultId: z.uuid(),
+      observation: localCommitNativeSchema.extend(localCommitQuiescenceSchema.shape),
+    })
+    .nullable()
+    .default(null),
   writeOccupancy: z.enum(['held', 'pending-release', 'released', 'unknown']),
   goalId: z.string().nullable(),
   goalObjective: z.string().nullable(),

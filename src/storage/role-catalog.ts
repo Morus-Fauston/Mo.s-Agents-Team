@@ -6,6 +6,7 @@ import { transaction } from './transaction.ts';
 import { ProjectError } from '../services/errors.ts';
 import { roleInputSchema, registeredRoleSchema } from '../contracts/roles.ts';
 import { roleUpdateSchema } from '../contracts/roles.ts';
+import { fallbackPolicySchema } from '../contracts/model-policy.ts';
 import type { RoleInput, RegisteredRole, RoleUpdate } from '../contracts/roles.ts';
 export function migrateRoles(db: DatabaseSync): void {
   db.exec(`ALTER TABLE role ADD COLUMN name TEXT NOT NULL DEFAULT '';
@@ -42,6 +43,14 @@ export class RoleCatalog {
       name: row.name || (row.type === 'supervisor' ? '项目主管' : String(row.code)),
       type: String(row.type),
       configuration: JSON.parse(String(row.configuration)),
+      fallback: fallbackPolicySchema.parse(
+        JSON.parse(
+          String(
+            this.db.prepare('SELECT data FROM role_model_policy WHERE role_id=?').get(id)?.data ??
+              '{"enabled":false,"configuration":null}',
+          ),
+        ),
+      ),
       allowChildAgents: false,
       aliases: this.db
         .prepare('SELECT alias FROM role_alias WHERE role_id=? ORDER BY alias')
@@ -67,7 +76,11 @@ export class RoleCatalog {
   update(id: string, raw: RoleUpdate): RegisteredRole {
     const input = roleUpdateSchema.parse(raw);
     const previous = this.get(id);
-    if (input.name === undefined && input.configuration === undefined)
+    if (
+      input.name === undefined &&
+      input.configuration === undefined &&
+      input.fallback === undefined
+    )
       throw new ProjectError('EMPTY_ROLE_UPDATE', '没有提供需要修改的角色配置');
     return transaction(this.db, () => {
       this.db
@@ -77,6 +90,12 @@ export class RoleCatalog {
           JSON.stringify(input.configuration ?? previous.configuration),
           id,
         );
+      if (input.fallback !== undefined)
+        this.db
+          .prepare(
+            'INSERT INTO role_model_policy(role_id,data) VALUES(?,?) ON CONFLICT(role_id) DO UPDATE SET data=excluded.data',
+          )
+          .run(id, JSON.stringify(input.fallback));
       return this.get(id);
     });
   }
@@ -96,7 +115,8 @@ export class RoleCatalog {
       if (
         role.name === input.name &&
         role.type === input.type &&
-        JSON.stringify(role.configuration) === JSON.stringify(input.configuration)
+        JSON.stringify(role.configuration) === JSON.stringify(input.configuration) &&
+        JSON.stringify(role.fallback) === JSON.stringify(input.fallback)
       )
         return role;
       throw new ProjectError('ROLE_EXISTS', '角色标识已登记，请通过维护配置修改');
@@ -145,6 +165,9 @@ export class RoleCatalog {
         .prepare('INSERT INTO role(id,code,type,configuration,name) VALUES(?,?,?,?,?)')
         .run(id, input.code, input.type, JSON.stringify(input.configuration), input.name);
       this.db.prepare('INSERT INTO role_alias(alias,role_id) VALUES(?,?)').run(input.code, id);
+      this.db
+        .prepare('INSERT INTO role_model_policy(role_id,data) VALUES(?,?)')
+        .run(id, JSON.stringify(input.fallback));
       this.db.prepare('DELETE FROM role_preparation WHERE code=?').run(input.code);
       return this.get(id);
     });

@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { dispatchBodySchema } from '../contracts/execution.ts';
+import { dispatchBodySchema, scopeAdjustmentBodySchema } from '../contracts/execution.ts';
 import type { DispatchService } from '../services/dispatch-service.ts';
 import type { ProjectConnection } from '../services/project.ts';
 import { ProjectError } from '../services/errors.ts';
@@ -68,7 +68,7 @@ export function installExecutionTools(
   if (role === 'supervisor')
     register(
       'mat_dispatch',
-      '仅主管可正式派工一张已开启阶段内的待办票据。选择一个新开角色或一个明确已有会话。返回登记不代表启动通过；用mat_execution核对至少三个实际Agent步骤。不要重复调用来重试未知结果。',
+      '仅主管可正式派工一张已开启阶段内的待办票据。选择一个新开角色或一个明确已有会话。正式收尾的原会话接下一票时，明确sessionId、reuseClosedExecutionId及新范围；原生停稳未确认或有独立暂停时不接管。返回登记不代表启动通过；用mat_execution核对至少三个实际Agent步骤。不要重复调用来重试未知结果。原合入明确修正或组合票使用mergeId关联原交接；不得借非空id扩围，目录和范围必须对应。',
       dispatchBodySchema,
       (input, exec) => {
         const binding = resolve(owner),
@@ -159,6 +159,48 @@ export function installExecutionTools(
       };
     },
   );
+  if (controls)
+    register(
+      'mat_recovery_preview',
+      '只读核对原执行停稳后的文件、规范与授权变化。不会加载会话或恢复Goal。若有变化，原主管核对差异后在mat_control resume中填入本次reviewedRecoveryFingerprint；fileCount超过40用offset查看后续。',
+      z
+        .object({ executionId: z.uuid(), offset: z.number().int().nonnegative().default(0) })
+        .strict(),
+      (input) =>
+        controls.recoveryPreview(
+          resolve(owner).connection.snapshot().id,
+          input.executionId,
+          input.offset,
+        ),
+    );
+  if (controls && role === 'supervisor')
+    register(
+      'mat_adjust_write_scope',
+      '原主管在原执行确认停稳、释放范围之后调整声明写域。按原控制修订和范围修订办理，保留前后范围；空数组为只读。扩大须引用本次主执行结构化范围提案的正式接受决定。保存不恢复原Goal；恢复前用mat_recovery_preview核对变化。',
+      scopeAdjustmentBodySchema,
+      (input, exec) => {
+        const binding = resolve(owner),
+          event = owner.session
+            .snapshotEvents()
+            .findLast(
+              (event) =>
+                event.type === 'tool/call' &&
+                event.data.name === 'mat_adjust_write_scope' &&
+                event.data.callId === exec.callId,
+            );
+        if (!event) throw new ProjectError('TOOL_CALL_ID_REQUIRED', '调整范围缺少真实工具调用记录');
+        return controls.adjustScope(
+          binding.connection.snapshot().id,
+          { kind: 'session', sessionId: binding.sessionId },
+          {
+            ...input,
+            operationId: messageIdentity(
+              'mat_adjust_write_scope:' + owner.id + ':' + event.seq + ':' + exec.callId,
+            ),
+          },
+        );
+      },
+    );
   if (controls)
     register(
       'mat_control',

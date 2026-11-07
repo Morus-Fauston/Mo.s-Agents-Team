@@ -15,6 +15,9 @@ function fixture() {
     ({
       id,
       status: 'idle',
+      cancel: () => {
+        calls.push({ name: 'cancel', value: id });
+      },
       inbox: { nextStep: [] },
       session: {
         snapshotEvents: () => [],
@@ -225,6 +228,75 @@ test('完成Chat服务挂起原Goal，异步仅一次启动新的审核会话并
     const notice = f.connection.messages().get(review.notifications[0]!.messageId);
     expect(notice.message.sender.kind).toBe('system');
     expect(notice.message.content).toContain(saved.reviewId);
+  } finally {
+    await f.dispose();
+  }
+});
+
+test('主执行明确恢复后完成独审，历史hard模式不重新赋予取消或kill审核的权限', async () => {
+  const f = fixture();
+  try {
+    const c = f.connection,
+      controls = c.controls(),
+      user = { kind: 'user' as const };
+    const stop = controls.request(
+      user,
+      {
+        operationId: randomUUID(),
+        executionId: f.execution.id,
+        action: 'hard-stop',
+        expectedRevision: 0,
+        reason: '单元合成原停止',
+      },
+      'unit',
+    );
+    controls.receipt(stop.id, 'goal', { state: 'confirmed', note: '原Goal' });
+    controls.receipt(stop.id, 'cancel', { state: 'confirmed', note: '原取消' });
+    controls.observeStopped(stop.id, {
+      agentIdle: true,
+      inFlightTools: false,
+      filesStable: true,
+      fileFingerprint: 'unit',
+      processesComplete: true,
+      jobObservations: [],
+      note: '合成',
+    });
+    const resume = controls.request(
+      user,
+      {
+        operationId: randomUUID(),
+        executionId: f.execution.id,
+        action: 'resume',
+        expectedRevision: 1,
+        reason: '明确恢复原执行',
+      },
+      'unit',
+    );
+    controls.resumeAdmitted(resume.id, {}, 'unit', () => {});
+    controls.setStatus(resume.id, 'resumed');
+    const completion = f.service.complete(c.snapshot().id, f.session.id, f.author, {
+      operationId: randomUUID(),
+      summary: '恢复后正常交付',
+      scope: '原范围',
+    });
+    await expect.poll(() => c.reviews().get(completion.reviewId).status).toBe('active');
+    const review = c.reviews().get(completion.reviewId);
+    c.reviewResults().submit(
+      { kind: 'session', sessionId: review.sessionId! },
+      {
+        operationId: randomUUID(),
+        reviewId: review.id,
+        versionId: review.versionId,
+        verdict: 'pass',
+        scope: '原送审版本',
+        basis: '仅事务边界替身',
+        issues: [],
+        evidencePaths: [],
+      },
+    );
+    await f.service.settleReview(c.snapshot().id, review.id);
+    expect(c.reviews().get(review.id).control?.state).toBe('confirmed');
+    expect(f.calls.filter((call) => call.name === 'cancel')).toHaveLength(0);
   } finally {
     await f.dispose();
   }

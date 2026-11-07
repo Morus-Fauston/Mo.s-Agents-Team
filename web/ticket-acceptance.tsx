@@ -23,7 +23,19 @@ const acceptanceViewSchema = z.object({
   escalations: z.array(escalationSchema),
   notices: z.array(acceptanceNoticeSchema),
 });
-export function TicketAcceptance({ projectId, ticketId }: { projectId: string; ticketId: string }) {
+export function TicketAcceptance({
+  projectId,
+  ticketId,
+  openVersion,
+  recordId,
+  showAll,
+}: {
+  projectId: string;
+  ticketId: string;
+  openVersion: (id: string) => void;
+  recordId: string | null;
+  showAll: () => void;
+}) {
   const base = `/api/projects/${projectId}`,
     run = useWorkbenchCommand(projectId),
     query = useQuery({
@@ -41,16 +53,43 @@ export function TicketAcceptance({ projectId, ticketId }: { projectId: string; t
   if (query.isPending) return <p role="status">正在读取正式审阅及验收…</p>;
   if (query.isError) return <p role="alert">{query.error.message}</p>;
   const { acceptance: a, opinions } = query.data;
+  const assignments = recordId
+      ? a.assignments.filter(
+          ({ assignment, result }) => assignment.id === recordId || result?.id === recordId,
+        )
+      : a.assignments,
+    accepted = recordId ? a.accepted.filter((item) => item.id === recordId) : a.accepted,
+    versionId = assignments[0]?.assignment.versionId ?? accepted[0]?.versionId,
+    visibleOpinions = recordId ? opinions.filter((item) => item.versionId === versionId) : opinions;
   return (
     <section aria-label="审阅与验收">
+      {recordId && (
+        <p>
+          {versionId ? '已定位原验收记录。' : '该验收记录不属于本票或不可读。'}{' '}
+          <button type="button" className={styles.button} onClick={showAll}>
+            查看本票全部验收
+          </button>
+        </p>
+      )}
       <h4>正式审阅与办理进展</h4>
-      {!opinions.length && <p>尚无正式审阅意见。</p>}
-      {opinions.map((r) => (
+      {!visibleOpinions.length && (
+        <p>{recordId ? '没有可读的对应版本意见。' : '尚无正式审阅意见。'}</p>
+      )}
+      {visibleOpinions.map((r) => (
         <article key={r.id} aria-label={r.verdict === 'pass' ? '正式通过意见' : '正式退回意见'}>
           <h5>{r.verdict === 'pass' ? '审阅通过' : '退回原尝试修正'}</h5>
           <dl className={styles.facts}>
             <dt>固定版本</dt>
-            <dd>{r.versionId}</dd>
+            <dd>
+              <button
+                type="button"
+                className={styles.textButton}
+                onClick={() => openVersion(r.versionId)}
+              >
+                查看对应固定成果
+              </button>{' '}
+              · {r.versionId}
+            </dd>
             <dt>实际审阅者</dt>
             <dd>{r.author.address ?? r.author.sessionId}</dd>
             <dt>正式意见</dt>
@@ -117,8 +156,8 @@ export function TicketAcceptance({ projectId, ticketId }: { projectId: string; t
       <p>
         主管根据对应版本安排责任方。人工项由你记录接受或退回；主管再核对整票并确认完成。需补做已收尾成果时，由主管明确安排关联新尝试。
       </p>
-      {!a.assignments.length && <p>尚无指定验收安排。</p>}
-      {a.assignments.map(({ assignment: s, result: r }) => (
+      {!recordId && !assignments.length && <p>尚无指定验收安排。</p>}
+      {assignments.map(({ assignment: s, result: r }) => (
         <article key={s.id} aria-label="指定验收事项">
           <h5>
             {s.criterion} · {s.required ? '必需' : '可选'}
@@ -127,6 +166,12 @@ export function TicketAcceptance({ projectId, ticketId }: { projectId: string; t
           <p>责任方：{s.owner.kind === 'user' ? '用户本人' : s.owner.sessionId}</p>
           <p>固定版本：{s.versionId}</p>
           <p>安排依据：{s.reason}</p>
+          {recordId && (
+            <p>
+              安排 {s.id}
+              {r ? ` · 结果 ${r.id}` : ''}
+            </p>
+          )}
           {r ? (
             <>
               <p>
@@ -182,34 +227,37 @@ export function TicketAcceptance({ projectId, ticketId }: { projectId: string; t
           )}
         </article>
       ))}
-      {a.accepted.map((r) => (
+      {accepted.map((r) => (
         <article key={r.id}>
           <h5>主管整体接受</h5>
+          {recordId && <p>接受记录 {r.id}</p>}
           <p>{r.basis}</p>
           <p>
             对应版本：{r.versionId} · 实际主管：{r.author.address} · {r.createdAt}
           </p>
         </article>
       ))}
-      {a.supplements.map((r) => (
-        <article key={r.id}>
-          <h5>主管退回补做</h5>
-          <p>{r.reason}</p>
-          <p>
-            旧尝试 {r.previousExecutionId} → 新尝试 {r.executionId}
-          </p>
-          <p>关联意见：{r.resultId}</p>
-        </article>
-      ))}
-      {a.escalations.map((r) => (
-        <article key={r.id}>
-          <h5>显式争议与扩围请求 · {r.kind}</h5>
-          <p>{r.basis}</p>
-          <p>
-            原意见 {r.resultId} · 主管待处理 {r.taskId}
-          </p>
-        </article>
-      ))}
+      {!recordId &&
+        a.supplements.map((r) => (
+          <article key={r.id}>
+            <h5>主管退回补做</h5>
+            <p>{r.reason}</p>
+            <p>
+              旧尝试 {r.previousExecutionId} → 新尝试 {r.executionId}
+            </p>
+            <p>关联意见：{r.resultId}</p>
+          </article>
+        ))}
+      {!recordId &&
+        a.escalations.map((r) => (
+          <article key={r.id}>
+            <h5>显式争议与扩围请求 · {r.kind}</h5>
+            <p>{r.basis}</p>
+            <p>
+              原意见 {r.resultId} · 主管待处理 {r.taskId}
+            </p>
+          </article>
+        ))}
       <details>
         <summary>通知回执</summary>
         <ul>

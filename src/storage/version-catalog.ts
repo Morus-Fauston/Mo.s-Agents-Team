@@ -1,6 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import { join } from 'node:path';
+import { join, relative, sep } from 'node:path';
+import { isAbsolute } from 'node:path';
+import { realpathSync, lstatSync } from 'node:fs';
+import { withinPath } from '../services/write-scopes.ts';
 import { deliveryVersionInputSchema, deliveryVersionSchema } from '../contracts/versions.ts';
 import type { DeliveryVersion, SnapshotInput } from '../contracts/versions.ts';
 import type { WorkbenchActor } from '../contracts/workbench.ts';
@@ -29,6 +32,10 @@ export class VersionCatalog {
   private readonly sessions: SessionCatalog;
   private readonly root: string;
   readonly storage: string;
+  private mergeContext: ((executionId: string) => SnapshotInput['mergeRepair']) | undefined;
+  bindMergeContext(context: NonNullable<VersionCatalog['mergeContext']>) {
+    this.mergeContext = context;
+  }
   constructor(
     db: DatabaseSync,
     executions: ExecutionCatalog,
@@ -73,6 +80,7 @@ export class VersionCatalog {
       materialRoots: domains.map((domain) => domain.path),
       storage: this.storage,
       excluded: [join(this.root, '.TEAM', '运行数据'), join(this.root, '.TEAM', '票据材料')],
+      mergeRepair: this.mergeContext?.(executionId),
     };
   }
   private save(record: DeliveryVersion, requestHash: string): DeliveryVersion {
@@ -112,6 +120,7 @@ export class VersionCatalog {
           operationId: execution.dispatchId,
           executionId,
           kind: 'baseline',
+          worktreeId: execution.worktreeId,
           sequence: 0,
           actor: execution.actor,
           ticket: this.wb.getTicket(execution.ticketId),
@@ -119,10 +128,85 @@ export class VersionCatalog {
           scope: '实际源码仓库、明确其他仓库与本次执行材料',
           evidencePaths: [],
           checklistItemIds: [],
+          reportPaths: [],
+          researchAnswers: [],
           snapshot,
           createdAt: snapshot.createdAt,
         },
         hash({ executionId, kind: 'baseline' }),
+      ),
+    );
+  }
+  assertSourceUnchanged(executionId: string, originalCwd?: string): void {
+    const versions = this.list(executionId);
+    if (versions.some((v) => v.kind === 'delivery'))
+      throw new ProjectError(
+        'WORKTREE_DELIVERY_EXISTS',
+        '本次已有送审版本，不迁移其源码空间；请主管另行明确下一票',
+      );
+    const input = this.input(executionId),
+      current = inspectWorkspace({ ...input, cwd: originalCwd ?? input.cwd, materialRoots: [] }),
+      baseline = versions.findLast(
+        (v) => v.kind === 'baseline' && v.snapshot.roots[0]?.root === current.roots[0]?.root,
+      );
+    if (!baseline) throw new ProjectError('WORKTREE_SOURCE_BASELINE', '没有原源码空间的实际基线');
+    const normalize = (roots: typeof current.roots) =>
+      roots
+        .filter((r) => r.kind === 'git')
+        .map((r) => ({
+          root: r.root,
+          head: r.head,
+          files: r.files.map(({ path, sha256, mode, size }) => ({ path, sha256, mode, size })),
+        }));
+    if (
+      JSON.stringify(normalize(current.roots)) !==
+      JSON.stringify(normalize(baseline.snapshot.roots))
+    )
+      throw new ProjectError(
+        'WORKTREE_SOURCE_CHANGED',
+        '原源码自执行基线后已有变化，先协调成果，不把未提交工作当已迁入新树',
+      );
+  }
+  workspaceBaseline(
+    actor: WorkbenchActor,
+    executionId: string,
+    worktreeId: string,
+  ): DeliveryVersion {
+    const execution = this.executions.get(executionId),
+      author = this.wb.author(actor);
+    if (
+      actor.kind !== 'session' ||
+      (actor.sessionId !== execution.sessionId && author.roleType !== 'supervisor') ||
+      execution.worktreeId !== worktreeId
+    )
+      throw new ProjectError('WORKTREE_BASELINE_SOURCE', '工作树基线须绑定本次原主及已核定新目录');
+    const prior = this.list(executionId),
+      existing = prior.find((v) => v.operationId === worktreeId);
+    if (existing) return existing;
+    if (prior.some((v) => v.kind === 'delivery'))
+      throw new ProjectError('WORKTREE_DELIVERY_EXISTS', '不改已有送审版本的空间');
+    const snapshot = captureWorkspace(this.input(executionId));
+    return transaction(this.db, () =>
+      this.save(
+        {
+          id: randomUUID(),
+          operationId: worktreeId,
+          executionId,
+          kind: 'baseline',
+          worktreeId,
+          sequence: prior.length,
+          actor: author,
+          ticket: this.wb.getTicket(execution.ticketId),
+          summary: '官方工作树实际空间基线；原启动基线保留',
+          scope: '明确本地commit检出后的源码空间与原固定材料域，不搬运旧根未提交内容',
+          evidencePaths: [],
+          checklistItemIds: [],
+          reportPaths: [],
+          researchAnswers: [],
+          snapshot,
+          createdAt: snapshot.createdAt,
+        },
+        hash({ executionId, worktreeId, kind: 'workspace-baseline' }),
       ),
     );
   }
@@ -156,9 +240,60 @@ export class VersionCatalog {
     if (!previous.some((version) => version.kind === 'baseline'))
       throw new ProjectError('VERSION_BASELINE_MISSING', '缺少真实派工基线，未用当前目录伪造');
     const ticket = this.wb.getTicket(execution.ticketId);
+    if (ticket.kind === 'research' && execution.roleType !== 'investigator')
+      throw new ProjectError('RESEARCH_INVESTIGATOR_REQUIRED', '研究报告由实际调查主执行交付');
+    if (ticket.kind === 'research' && !input.reportPaths.length)
+      throw new ProjectError(
+        'RESEARCH_REPORT_REQUIRED',
+        '研究报告须放在本次材料域并显式关联完成交付',
+      );
+    const domains = this.wb
+      .materialDomains(ticket.id)
+      .filter((domain) => domain.referenceId === execution.id);
+    const reportPaths = [
+      ...new Set(
+        input.reportPaths.map((path) => {
+          if (!isAbsolute(path))
+            throw new ProjectError('REPORT_PATH_REQUIRED', '报告必须是本次材料域内的绝对文件路径');
+          let canonical: string;
+          try {
+            canonical = realpathSync(path);
+            if (!lstatSync(path).isFile() || lstatSync(path).isSymbolicLink())
+              throw new Error('不是普通文件');
+          } catch {
+            throw new ProjectError('REPORT_UNAVAILABLE', '报告文件不存在或不是可核对的普通文件');
+          }
+          if (
+            !domains.some(
+              (domain) => domain.available && withinPath(realpathSync(domain.path), canonical),
+            )
+          )
+            throw new ProjectError('REPORT_OUTSIDE_MATERIAL', '报告须来自本次主执行分配材料域');
+          return canonical;
+        }),
+      ),
+    ];
+    const researchAnswers =
+      ticket.kind === 'research'
+        ? this.wb
+            .research(ticket.id)
+            .entries.flatMap((entry) => (entry.answer ? [entry.answer] : []))
+        : [];
     if (input.checklistItemIds.some((id) => !ticket.checklist.some((item) => item.id === id)))
       throw new ProjectError('VERSION_CHECKLIST_MISMATCH', '交付引用了不属于原票的Checklist');
     const snapshot = captureWorkspace(this.input(executionId));
+    for (const path of reportPaths)
+      if (
+        !snapshot.roots.some(
+          (root) =>
+            withinPath(root.root, path) &&
+            root.files.some((file) => file.path === relative(root.root, path).split(sep).join('/')),
+        )
+      )
+        throw new ProjectError(
+          'REPORT_NOT_CAPTURED',
+          '报告未进入本次固定原件，不能仅登记当前文件路径',
+        );
     return transaction(this.db, () =>
       this.save(
         {
@@ -166,6 +301,7 @@ export class VersionCatalog {
           operationId: input.operationId,
           executionId,
           kind: 'delivery',
+          worktreeId: execution.worktreeId,
           sequence: previous.length,
           actor: author,
           ticket,
@@ -173,6 +309,8 @@ export class VersionCatalog {
           scope: input.scope,
           evidencePaths: input.evidencePaths,
           checklistItemIds: input.checklistItemIds,
+          reportPaths,
+          researchAnswers,
           snapshot,
           createdAt: snapshot.createdAt,
         },
@@ -206,7 +344,11 @@ export class VersionCatalog {
       list = this.list(saved.executionId),
       previous =
         mode === 'ticket'
-          ? list.find((version) => version.kind === 'baseline')
+          ? list
+              .filter(
+                (version) => version.kind === 'baseline' && version.sequence <= saved.sequence,
+              )
+              .at(-1)
           : list
               .filter((version) => version.kind === 'delivery' && version.sequence < saved.sequence)
               .at(-1);
@@ -230,6 +372,8 @@ export class VersionCatalog {
       id: record.id,
       executionId: record.executionId,
       kind: record.kind,
+      worktreeId: record.worktreeId,
+      ticketKind: record.ticket.kind,
       sequence: record.sequence,
       summary: record.summary,
       scope: record.scope,

@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useLayoutEffect, useState, useRef } from 'react';
 import type { FormEvent } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Dialog } from 'radix-ui';
@@ -14,6 +14,7 @@ import type { ProjectView } from '../src/contracts/project';
 import { request } from './request';
 import styles from './workbench.module.css';
 import { useProjectUpdates } from './project-events';
+import shell from './workspace-shell.module.css';
 const historySchema = z.object({
   conversation: conversationSchema,
   messages: z.array(savedMessageSchema),
@@ -26,6 +27,8 @@ interface Draft {
   attempted: boolean;
 }
 const drafts = new Map<string, Draft>();
+const readingPositions = new Map<string, number>();
+const pendingReplyTargets = new Map<string, string>();
 const fresh = (): Draft => ({
   id: crypto.randomUUID(),
   content: '',
@@ -348,16 +351,33 @@ function Composer({
     </>
   );
 }
-export function ChatPanel({ project }: { project: ProjectView }) {
+export function ChatPanel({
+  project,
+  mode,
+  managerSessionId,
+  initialSessionId,
+}: {
+  project: ProjectView;
+  mode: 'supervisor' | 'private';
+  managerSessionId: string | null;
+  initialSessionId: string | null;
+}) {
   const path = `/api/projects/${project.id}`,
     client = useQueryClient(),
     updates = useProjectUpdates(project.id);
   const [category, setCategory] = useState<'user' | 'members'>('user');
-  const [selected, setSelected] = useState<
+  const [privateSelection, setSelected] = useState<
     { kind: 'user'; sessionId: string } | { kind: 'members'; conversationId: string } | null
-  >(null);
-  const [reply, setReply] = useState<string | null>(null);
+  >(initialSessionId ? { kind: 'user', sessionId: initialSessionId } : null);
+  const selected =
+    mode === 'supervisor'
+      ? managerSessionId
+        ? { kind: 'user' as const, sessionId: managerSessionId }
+        : null
+      : privateSelection;
+  const [activeReply, setActiveReply] = useState<{ key: string; id: string | null } | null>(null);
   const [reference, setReference] = useState<{ id: string; index: number } | null>(null);
+  const historyPane = useRef<HTMLDivElement | null>(null);
   const sessions = useQuery({
     queryKey: ['sessions', project.id],
     queryFn: async () => z.array(sessionSchema).parse(await request(path + '/sessions')),
@@ -381,6 +401,27 @@ export function ChatPanel({ project }: { project: ProjectView }) {
     queryFn: async () =>
       historySchema.parse(await request(path + '/conversations/' + conversation!.id)),
   });
+  const readingKey = selected
+    ? `${project.id}:${selected.kind === 'user' ? selected.sessionId : selected.conversationId}`
+    : null;
+  const reply =
+    readingKey && selected?.kind === 'user'
+      ? activeReply?.key === readingKey
+        ? activeReply.id
+        : (pendingReplyTargets.get(readingKey) ?? null)
+      : null;
+  const setReply = (id: string | null) => {
+    if (!readingKey || selected?.kind !== 'user') return;
+    if (id) pendingReplyTargets.set(readingKey, id);
+    else pendingReplyTargets.delete(readingKey);
+    setActiveReply({ key: readingKey, id });
+  };
+  const hasHistory = !!history.data;
+  useLayoutEffect(() => {
+    const pane = historyPane.current;
+    if (pane && readingKey && hasHistory)
+      pane.scrollTop = readingPositions.get(readingKey) ?? pane.scrollHeight;
+  }, [readingKey, hasHistory]);
   const preview = useQuery({
     queryKey: ['chat-reference', project.id, reference?.id, reference?.index],
     enabled: reference !== null,
@@ -409,7 +450,9 @@ export function ChatPanel({ project }: { project: ProjectView }) {
       ? sessions.data?.find((session) => session.id === selected.sessionId)
       : undefined;
   const canSend =
-    target?.status === 'bound' && !['terminated', 'archived'].includes(target.communicationState);
+    target?.status === 'bound' &&
+    !['terminated', 'archived'].includes(target.communicationState) &&
+    target.communicationOrigin?.kind !== 'execution-closed';
   const humanSessions =
     sessions.data?.filter(
       (session) =>
@@ -420,11 +463,11 @@ export function ChatPanel({ project }: { project: ProjectView }) {
     ) ?? [];
   const members = conversations.data?.filter((item) => !item.participants.includes('user')) ?? [];
   return (
-    <section className={styles.chatSection}>
+    <section className={`${styles.chatSection} ${shell.chatSurface}`}>
       <div className={styles.sectionHeader}>
-        <h3>私聊</h3>
+        <h2>{mode === 'supervisor' ? '主管默认会话' : '私聊联系人与消息'}</h2>
         <button type="button" className={styles.button} onClick={() => void refresh()}>
-          刷新私聊
+          刷新消息
         </button>
       </div>
       <p className={styles.description}>{updates}</p>
@@ -433,87 +476,92 @@ export function ChatPanel({ project }: { project: ProjectView }) {
           {error!.message}
         </p>
       ))}
-      <div className={styles.chatLayout}>
-        <nav className={styles.chatNav} aria-label="私聊联系人">
-          <div className={styles.tabs}>
-            <button
-              type="button"
-              aria-pressed={category === 'user'}
-              onClick={() => {
-                setCategory('user');
-                setSelected(null);
-                setReply(null);
-              }}
-            >
-              我的私聊
-            </button>
-            <button
-              type="button"
-              aria-pressed={category === 'members'}
-              onClick={() => {
-                setCategory('members');
-                setSelected(null);
-                setReply(null);
-              }}
-            >
-              成员间（只读）
-            </button>
-          </div>
-          {category === 'user'
-            ? humanSessions.map((session) => (
-                <button
-                  type="button"
-                  key={session.id}
-                  className={styles.contact}
-                  aria-pressed={selected?.kind === 'user' && selected.sessionId === session.id}
-                  onClick={() => {
-                    setSelected({ kind: 'user', sessionId: session.id });
-                    setReply(null);
-                  }}
-                >
-                  <strong>{session.name}</strong>
-                  <span>{session.addresses.readable}</span>
-                  <span>
-                    {session.status !== 'bound'
-                      ? '历史，只读'
-                      : session.communicationState === 'paused'
-                        ? '暂停，仅保存消息'
-                        : session.communicationState === 'terminated' ||
-                            session.communicationState === 'archived'
-                          ? '已停止，只读'
-                          : '可交流'}
-                  </span>
-                </button>
-              ))
-            : members.map((item) => (
-                <button
-                  type="button"
-                  className={styles.contact}
-                  key={item.id}
-                  aria-pressed={selected?.kind === 'members' && selected.conversationId === item.id}
-                  onClick={() => {
-                    setSelected({ kind: 'members', conversationId: item.id });
-                    setReply(null);
-                  }}
-                >
-                  {item.participants
-                    .map(
-                      (id) =>
-                        sessions.data?.find((session) => session.id === id)?.addresses.readable ??
-                        (id === 'mat-platform' ? 'MAT平台' : id),
-                    )
-                    .join(' ↔ ')}
-                </button>
-              ))}
-          {category === 'user' && humanSessions.length === 0 && (
-            <p>先在“角色与会话”中准备工作会话。</p>
-          )}
-          {category === 'members' && members.length === 0 && <p>暂无成员间私聊。</p>}
-        </nav>
+      {mode === 'supervisor' && (
+        <p className={styles.description}>从这里和当前项目主管交流。专注会话及定向信道未接入。</p>
+      )}
+      <div className={mode === 'supervisor' ? shell.supervisorChat : styles.chatLayout}>
+        {mode === 'private' && (
+          <nav className={styles.chatNav} aria-label="私聊联系人">
+            <div className={styles.tabs}>
+              <button
+                type="button"
+                aria-pressed={category === 'user'}
+                onClick={() => {
+                  setCategory('user');
+                  setSelected(null);
+                }}
+              >
+                我的私聊
+              </button>
+              <button
+                type="button"
+                aria-pressed={category === 'members'}
+                onClick={() => {
+                  setCategory('members');
+                  setSelected(null);
+                }}
+              >
+                成员间（只读）
+              </button>
+            </div>
+            {category === 'user'
+              ? humanSessions.map((session) => (
+                  <button
+                    type="button"
+                    key={session.id}
+                    className={styles.contact}
+                    aria-pressed={selected?.kind === 'user' && selected.sessionId === session.id}
+                    onClick={() => {
+                      setSelected({ kind: 'user', sessionId: session.id });
+                    }}
+                  >
+                    <strong>{session.name}</strong>
+                    <span>{session.addresses.readable}</span>
+                    <span>
+                      {session.status !== 'bound'
+                        ? '历史，只读'
+                        : session.communicationState === 'paused'
+                          ? session.communicationOrigin?.kind === 'execution-closed'
+                            ? '已收尾，只读'
+                            : '暂停，仅保存消息'
+                          : session.communicationState === 'terminated' ||
+                              session.communicationState === 'archived'
+                            ? '已停止，只读'
+                            : '可交流'}
+                    </span>
+                  </button>
+                ))
+              : members.map((item) => (
+                  <button
+                    type="button"
+                    className={styles.contact}
+                    key={item.id}
+                    aria-pressed={
+                      selected?.kind === 'members' && selected.conversationId === item.id
+                    }
+                    onClick={() => {
+                      setSelected({ kind: 'members', conversationId: item.id });
+                    }}
+                  >
+                    {item.participants
+                      .map(
+                        (id) =>
+                          sessions.data?.find((session) => session.id === id)?.addresses.readable ??
+                          (id === 'mat-platform' ? 'MAT平台' : id),
+                      )
+                      .join(' ↔ ')}
+                  </button>
+                ))}
+            {category === 'user' && humanSessions.length === 0 && <p>还没有可显示的私聊会话。</p>}
+            {category === 'members' && members.length === 0 && <p>暂无成员间私聊。</p>}
+          </nav>
+        )}
         <div className={styles.chatConversation}>
           {!selected ? (
             <p className={styles.description}>
-              选择一个明确会话查看或交流。同一角色的多个会话分别列出。
+              {mode === 'supervisor'
+                ? '暂未取得项目主管默认会话。可在配置中核对项目运行状态。'
+                : '选择一个明确会话查看或交流。同一角色的多个会话分别列出。'}
             </p>
           ) : (
             <>
@@ -539,7 +587,14 @@ export function ChatPanel({ project }: { project: ProjectView }) {
                   {retry.error.message}
                 </p>
               )}
-              <div className={styles.chatHistory} aria-label="私聊消息">
+              <div
+                className={styles.chatHistory}
+                aria-label="私聊消息"
+                ref={historyPane}
+                onScroll={(event) => {
+                  if (readingKey) readingPositions.set(readingKey, event.currentTarget.scrollTop);
+                }}
+              >
                 {history.data?.messages.map((saved) => (
                   <Message
                     key={saved.message.id}
@@ -554,9 +609,13 @@ export function ChatPanel({ project }: { project: ProjectView }) {
                       : {})}
                   />
                 ))}
-                {!history.data?.messages.length && !history.isFetching && (
-                  <p className={styles.description}>尚无消息。点击发送后才保存和投递。</p>
-                )}
+                {!history.data?.messages.length &&
+                  !history.isFetching &&
+                  !history.isError &&
+                  !conversations.isPending &&
+                  !conversations.isError && (
+                    <p className={styles.description}>尚无消息。点击发送后才保存和投递。</p>
+                  )}
               </div>
               {selected.kind === 'user' && canSend ? (
                 <Composer

@@ -2,14 +2,21 @@ import { dirname } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { NativeAgent, NativeContext, NativeEvent } from '../host/native.ts';
 import type { WorkbenchActor } from '../contracts/workbench.ts';
-import type { ControlRecord, StoppedObservation } from '../contracts/controls.ts';
-import { controlInputSchema } from '../contracts/controls.ts';
+import type {
+  ControlRecord,
+  RecoveryCheckpoint,
+  StoppedObservation,
+} from '../contracts/controls.ts';
+import { controlInputSchema, nativeTerminalJobStatuses } from '../contracts/controls.ts';
 import type { ProjectService } from './project-service.ts';
 import type { DispatchService } from './dispatch-service.ts';
 import type { CommunicationService } from './chat-service.ts';
 import { ProjectError } from './errors.ts';
 import { messageIdentity, presentMessage } from './message-presentation.ts';
-import { scopesOverlap } from './write-scopes.ts';
+import { canonicalDirectory } from './write-scopes.ts';
+import { assembleContext } from './context.ts';
+import { buildRecoveryCheckpoint, compareRecovery, recoveryPaths } from './recovery-checkpoint.ts';
+import { retainVersionOriginal } from './workspace-snapshot.ts';
 import {
   windowsProcessSnapshot,
   observeJobProcesses,
@@ -18,12 +25,14 @@ import {
   inFlightNativeTools,
 } from './quiescence.ts';
 import type { ProcessSnapshot } from './quiescence.ts';
+import type { AssistantControlService } from './assistant-controls.ts';
 export interface ControlHost {
   unassociatedProcesses?(sessionId: string, associatedIds: string[]): number;
   native: NativeContext;
   peek(projectId: string, sessionId: string): NativeAgent | undefined;
   openControlled(projectId: string, sessionId: string): Promise<NativeAgent>;
   freshContext(projectId: string, sessionId: string, agent: NativeAgent): Promise<unknown>;
+  checkMergeRecovery?(project: string, executionId: string, cwd: string): Promise<boolean>;
 }
 /** One queue per execution serializes native effects; durable control revisions fence stale work. */
 export class ExecutionControlService {
@@ -31,6 +40,7 @@ export class ExecutionControlService {
   private readonly dispatch: DispatchService;
   private readonly communication: CommunicationService;
   private readonly host: ControlHost;
+  private readonly assistants: AssistantControlService | undefined;
   private readonly queues = new Map<string, Promise<void>>();
   private readonly runs = new Map<string, Promise<void>>();
   private closed = false;
@@ -41,11 +51,13 @@ export class ExecutionControlService {
     dispatch: DispatchService,
     communication: CommunicationService,
     host: ControlHost,
+    assistants?: AssistantControlService,
   ) {
     this.projects = projects;
     this.dispatch = dispatch;
     this.communication = communication;
     this.host = host;
+    this.assistants = assistants;
     this.timer = setInterval(() => {
       void this.sampleActive().catch(() => {});
     }, 1000);
@@ -63,6 +75,7 @@ export class ExecutionControlService {
       !this.runs.has(value.id) &&
       ['requested', 'delivered', 'handoff', 'checking'].includes(value.status)
     ) {
+      this.assistants?.propagate(project, value);
       const key = project + ':' + value.executionId,
         previous = this.queues.get(key) ?? Promise.resolve(),
         job = previous.catch(() => {}).then(() => this.perform(project, value.id));
@@ -241,9 +254,26 @@ export class ExecutionControlService {
         catalog.unconfirmed(id, error.message);
         return;
       }
-      if (value.action === 'resume')
-        catalog.resumeFailed(id, error instanceof Error ? error.message : '恢复接纳未知');
-      else {
+      if (value.action === 'resume') {
+        const note = error instanceof Error ? error.message : '恢复接纳未知';
+        if (
+          error instanceof ProjectError &&
+          [
+            'RECOVERY_REVIEW_REQUIRED',
+            'RECOVERY_DRIFT',
+            'RECOVERY_UNREADABLE',
+            'RECOVERY_SCOPE_CHANGED',
+            'DEPENDENCY_NOT_READY',
+            'WRITE_SCOPE_BUSY',
+            'LOCAL_COMMIT_SCOPE_BUSY',
+            'MERGE_SCOPE_BUSY',
+            'MERGE_RECOVERY_UNAVAILABLE',
+          ].includes(error.code) &&
+          value.resumeSnapshot === null
+        )
+          catalog.resumeDeclined(id, note);
+        else catalog.resumeFailed(id, note);
+      } else {
         catalog.setStatus(id, 'unknown');
         catalog.receipt(id, 'goal', {
           state: 'unknown',
@@ -448,7 +478,14 @@ export class ExecutionControlService {
     const catalog = this.connection(project).controls(),
       value = catalog.get(id);
     try {
-      const observation = await this.inspectExecution(project, value.executionId, agent);
+      const observation = await this.inspectExecution(
+        project,
+        value.executionId,
+        agent,
+        undefined,
+        false,
+        true,
+      );
       if (this.closed) return false;
       catalog.observeStopped(id, observation);
       return true;
@@ -464,6 +501,7 @@ export class ExecutionControlService {
     agent: NativeAgent,
     reviewId?: string,
     afterResultClear = false,
+    captureCheckpoint = false,
   ): Promise<StoppedObservation> {
     const connection = this.connection(project),
       catalog = connection.controls(),
@@ -479,7 +517,8 @@ export class ExecutionControlService {
           ? [review.materialPath]
           : []
         : [...execution.writeScopes, ...materials],
-      excluded = [dirname(connection.snapshot().paths.database)];
+      excluded = [dirname(connection.snapshot().paths.database)],
+      scopeOptions = { excluded, excludeGitMetadata: !review };
     if (review && (review.executionId !== executionId || !review.materialPath || !review.goalId))
       throw new ProjectError('REVIEW_SCOPE_UNCONFIRMED', '审阅身份、Goal或材料范围尚未明确');
     const sessionId = review?.sessionId ?? execution.sessionId,
@@ -508,10 +547,20 @@ export class ExecutionControlService {
         throw new ProjectError('GOAL_BINDING_MISMATCH', '停稳核对目标不是原Agent的原Goal');
     };
     assertGoal();
-    const first = fingerprintPaths(paths, { excluded });
+    const first = fingerprintPaths(paths, scopeOptions);
     await delay(300);
     if (this.closed) throw new ProjectError('CONTROL_CLOSED', '停稳观察正在关闭');
-    const second = fingerprintPaths(paths, { excluded }),
+    const originals = new Map<string, Buffer>();
+    const second = fingerprintPaths(paths, {
+        ...scopeOptions,
+        ...(captureCheckpoint
+          ? {
+              retain: (sha: string, bytes: Buffer) => {
+                originals.set(sha, bytes);
+              },
+            }
+          : {}),
+      }),
       snapshot = await windowsProcessSnapshot(),
       jobObservations = this.processJob(project, execution.id, snapshot, reviewId),
       calls = inFlightNativeTools(
@@ -547,18 +596,178 @@ export class ExecutionControlService {
       intervalMs: 300,
     };
     assertGoal();
+    if (
+      captureCheckpoint &&
+      observation.agentIdle &&
+      !observation.inFlightTools &&
+      observation.filesStable &&
+      observation.processesComplete
+    ) {
+      try {
+        recoveryPaths(connection, execution);
+        const norms = this.lastAppliedNorms(agent);
+        if (!norms && execution.firstRequestId)
+          throw new ProjectError('RECOVERY_UNREADABLE', '原会话缺少实际采用的规范来源记录');
+        observation.checkpoint = buildRecoveryCheckpoint(
+          connection,
+          execution,
+          second.manifest,
+          norms ?? this.currentNorms(project, execution.id, agent),
+        );
+        for (const [sha, bytes] of originals)
+          retainVersionOriginal(connection.versions().storage, sha, bytes);
+      } catch (error) {
+        delete observation.checkpoint;
+        observation.note +=
+          '；恢复比较基线未固定：' + (error instanceof Error ? error.message : '缺少有效记录');
+      }
+    }
     return observation;
   }
+  private lastAppliedNorms(agent: NativeAgent): RecoveryCheckpoint['norms'] | undefined {
+    const source = agent.session
+      .deriveMessages()
+      .findLast((message) => message.source.kind === 'mat-context')?.source;
+    if (!Array.isArray(source?.sources)) return undefined;
+    const rows = source.sources as RecoveryCheckpoint['norms'];
+    if (!rows.every((row) => typeof row.path === 'string' && typeof row.sha256 === 'string'))
+      return undefined;
+    return rows.map(({ path, sha256 }) => ({ path, sha256 }));
+  }
+  private currentNorms(
+    project: string,
+    executionId: string,
+    agent: NativeAgent,
+  ): RecoveryCheckpoint['norms'] {
+    const c = this.connection(project),
+      e = c.executions().get(executionId);
+    if (
+      !e.sessionId ||
+      e.nativeSessionId !== agent.id ||
+      canonicalDirectory(this.host.native.workingDirectory.get(agent.session)) !== e.cwd
+    )
+      throw new ProjectError('RECOVERY_SCOPE_CHANGED', '原会话目录或绑定已变化');
+    const session = c.session(e.sessionId),
+      role = c.roles().find((row) => row.id === session.roleId);
+    if (!role) throw new ProjectError('RECOVERY_UNREADABLE', '原角色规范入口缺失');
+    return assembleContext(c.snapshot(), role, session, e.cwd).sources.map(({ path, sha256 }) => ({
+      path,
+      sha256,
+    }));
+  }
+  recoveryPreview(project: string, id: string, offset = 0) {
+    return this.readRecovery(project, id, this.connection(project).controls().revision(id), offset);
+  }
+  adjustScope(project: string, actor: WorkbenchActor, raw: unknown) {
+    if (this.closed) throw new ProjectError('CONTROL_CLOSED', '执行控制正在关闭');
+    return this.connection(project)
+      .controls()
+      .adjustScope(actor, raw, (execution, scopes) => {
+        this.quietRecoveryAgent(project, execution.id);
+        recoveryPaths(this.connection(project), execution);
+        this.conflictGuard(project, execution.id, scopes);
+      });
+  }
+  private quietRecoveryAgent(project: string, id: string) {
+    const connection = this.connection(project),
+      e = connection.executions().get(id),
+      agent = e.sessionId ? this.host.peek(project, e.sessionId) : undefined,
+      goal = agent && this.goals().get(agent),
+      jobs = agent && this.host.native.jobs?.list(agent.id);
+    if (
+      !e.sessionId ||
+      !agent ||
+      !jobs ||
+      agent.id !== e.nativeSessionId ||
+      agent.status !== 'idle' ||
+      !goal ||
+      goal.id !== e.goalId ||
+      goal.activation !== 'disarmed' ||
+      goal.phase === 'complete' ||
+      inFlightNativeTools(agent.session.snapshotEvents(), e.startBoundarySeq ?? 0).length ||
+      jobs.some(
+        (job) => job.owner === agent.id && !nativeTerminalJobStatuses.includes(job.status),
+      ) ||
+      (this.host.unassociatedProcesses?.(e.sessionId, []) ?? 0) > 0 ||
+      connection
+        .controls()
+        .jobs(e.id)
+        .some((job) => job.managedRanges.some((range) => range.state !== 'gone'))
+    )
+      throw new ProjectError(
+        'RECOVERY_NATIVE_BUSY',
+        '原会话身份、Goal、工具或受管范围仍未核定停稳',
+      );
+    return agent;
+  }
+  private readRecovery(
+    project: string,
+    id: string,
+    revision: number,
+    offset = 0,
+    retain = false,
+    admitted = false,
+  ) {
+    const c = this.connection(project),
+      e = c.executions().get(id),
+      controls = c.controls(),
+      stop = controls.list(e.id).findLast((row) => ['hard-stop', 'soft-stop'].includes(row.action));
+    if (
+      (!admitted && (e.lifecycleState !== 'paused' || e.writeOccupancy !== 'released')) ||
+      !stop ||
+      stop.status !== 'stopped' ||
+      !e.sessionId ||
+      !e.goalId
+    )
+      throw new ProjectError('QUIESCENCE_REQUIRED', '原控制尚无已确认释放的停稳记录');
+    const agent = this.quietRecoveryAgent(project, e.id);
+    const { paths, excluded } = recoveryPaths(c, e);
+    const options = { excluded, excludeGitMetadata: true };
+    const files = fingerprintPaths(paths, {
+      ...options,
+      ...(retain
+        ? {
+            retain: (sha: string, bytes: Buffer) =>
+              retainVersionOriginal(c.versions().storage, sha, bytes),
+          }
+        : {}),
+    });
+    if (!files.complete || fingerprintPaths(paths, options).digest !== files.digest)
+      throw new ProjectError(
+        'RECOVERY_UNREADABLE',
+        '恢复范围无法完整读回或采样期间变化：' + files.note,
+      );
+    let norms: RecoveryCheckpoint['norms'];
+    try {
+      norms = this.currentNorms(project, id, agent);
+    } catch (error) {
+      throw new ProjectError(
+        'RECOVERY_UNREADABLE',
+        error instanceof Error ? error.message : '无法读取规范',
+      );
+    }
+    const current = buildRecoveryCheckpoint(c, e, files.manifest, norms);
+    return compareRecovery(
+      e.id,
+      revision,
+      stop.id,
+      stop.observation?.checkpoint,
+      current,
+      paths,
+      offset,
+    );
+  }
   conflictGuard(project: string, executionId: string, scopes: string[]): void {
-    for (const entry of this.projects.list())
-      if (!('unavailable' in entry))
-        for (const other of this.connection(entry.id).executions().list())
-          if (
-            !(entry.id === project && other.id === executionId) &&
-            other.writeOccupancy !== 'released' &&
-            other.writeScopes.some((a) => scopes.some((b) => scopesOverlap(a, b)))
-          )
-            throw new ProjectError('WRITE_SCOPE_BUSY', '恢复写域与另一执行的已知或未知占用冲突');
+    for (const entry of this.projects.list()) {
+      if ('unavailable' in entry) continue;
+      const c = this.connection(entry.id),
+        same = entry.id === project;
+      c.executions().guardExistingScope(
+        same ? executionId : '',
+        scopes,
+        same ? c.worktreeMerges().recoveryLink(executionId, scopes) : undefined,
+      );
+    }
   }
   private async resume(project: string, id: string): Promise<void> {
     const connection = this.connection(project),
@@ -585,6 +794,28 @@ export class ExecutionControlService {
         'RESUME_GOAL_UNCONFIRMED',
         '原Goal不可恢复或仍武装，不能复活或替换其他工作',
       );
+    if (
+      execution.mergeId &&
+      !(await this.host.checkMergeRecovery?.(project, execution.id, execution.cwd))
+    )
+      throw new ProjectError('MERGE_RECOVERY_UNAVAILABLE', '未确认原Git交接，不能恢复关联执行');
+    const recovery = this.readRecovery(project, execution.id, value.revision - 1, 0, true);
+    if (
+      recovery.hasChanges &&
+      (value.reviewedRecoveryFingerprint !== recovery.fingerprint ||
+        !value.actor.sessionId ||
+        !execution.managerSessionIds.includes(value.actor.sessionId) ||
+        connection.session(value.actor.sessionId).communicationState !== 'active')
+    )
+      throw new ProjectError(
+        'RECOVERY_REVIEW_REQUIRED',
+        '文件、规范、授权或依据有实质变化。由原管理入口读取本次恢复差异并明确确认。',
+      );
+    if (
+      value.reviewedRecoveryFingerprint &&
+      value.reviewedRecoveryFingerprint !== recovery.fingerprint
+    )
+      throw new ProjectError('RECOVERY_DRIFT', '恢复核对指纹已变化，请重新读取当前差异');
     const context = await this.host.freshContext(project, execution.sessionId, agent),
       ticket = connection.workbench().getTicket(execution.ticketId),
       snapshot = {
@@ -593,6 +824,7 @@ export class ExecutionControlService {
         included: ticket.included,
         excluded: ticket.excluded,
         context,
+        recovery,
         unhandled: connection
           .messages()
           .pending(execution.sessionId)
@@ -606,14 +838,30 @@ export class ExecutionControlService {
           .map((item) => ({ id: item.id, action: item.action, status: item.status })),
       };
     this.current(project, id);
-    catalog.resumeAdmitted(id, snapshot, this.dispatch.epoch, (current) =>
-      this.conflictGuard(project, current.id, current.writeScopes),
+    catalog.resumeAdmitted(
+      id,
+      snapshot,
+      this.dispatch.epoch,
+      (current) => {
+        this.conflictGuard(project, current.id, current.writeScopes);
+        if (
+          this.readRecovery(project, current.id, value.revision - 1).fingerprint !==
+          recovery.fingerprint
+        )
+          throw new ProjectError('RECOVERY_DRIFT', '接纳前现场已变化，未恢复原Goal');
+      },
+      connection.executions().resolveDependencies(ticket.dependencies),
     );
     try {
       await this.communication.prepareResume(project, execution.sessionId, agent);
       this.current(project, id);
       if (agent.status !== 'idle')
         throw new ProjectError('RESUME_AGENT_BUSY', '准备期间出现其他在途工作，未继续恢复');
+      if (
+        this.readRecovery(project, execution.id, value.revision - 1, 0, false, true).fingerprint !==
+        recovery.fingerprint
+      )
+        throw new ProjectError('RECOVERY_DRIFT', '准备输入后现场再次变化，未武装原Goal');
       const objective = this.dispatch.context(project, execution.sessionId, execution.cwd)?.message
         .content[0]?.text;
       if (!objective) throw new ProjectError('EXECUTION_CONTEXT_MISSING', '最新执行输入不可取得');
@@ -651,6 +899,15 @@ export class ExecutionControlService {
     const connection = this.connection(project),
       session = connection.session(sessionId);
     if (session.communicationState !== 'active') return false;
+    const assistant = connection.collaborations().currentForSession(sessionId);
+    if (assistant) {
+      const scope = connection.collaborations().scopeForSession(sessionId);
+      return (
+        !!scope?.allowWrite &&
+        (scope.shutdownOnly === true ||
+          (connection.snapshot().started && connection.controls().project().state === 'running'))
+      );
+    }
     const execution = connection.executions().currentForSession(sessionId);
     if (execution) {
       const control = connection.controls().activeControl(execution.id);
@@ -663,8 +920,10 @@ export class ExecutionControlService {
     const catalog = this.connection(project).controls();
     return {
       revision: catalog.revision(executionId),
-      controls: catalog.list(executionId),
+      controls: catalog.publicList(executionId),
       jobs: catalog.jobs(executionId),
+      assistantTargets: this.connection(project).assistantControls().forExecution(executionId),
+      assistants: this.connection(project).assistantControls().inventory(executionId),
     };
   }
   async close(): Promise<void> {

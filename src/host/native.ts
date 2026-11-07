@@ -44,7 +44,10 @@ export interface NativeAgent {
 }
 export interface ToolDefinition {
   name: string;
-  execute(args: unknown, exec: { agent?: NativeAgent; signal: AbortSignal }): Promise<unknown>;
+  execute(
+    args: unknown,
+    exec: { agent?: NativeAgent; signal: AbortSignal; callId?: string },
+  ): Promise<unknown>;
 }
 export interface StepInput {
   agent: NativeAgent;
@@ -56,7 +59,20 @@ export interface StepInput {
 export type StepDecision =
   { kind: 'enter'; messages: NativeMessage[] } | { kind: 'reject'; reason?: unknown };
 export interface NativeContext {
-  subprocess?: { spawn(spec: unknown): unknown };
+  reflect?: { get(name: string): unknown };
+  worktrees?: {
+    config: { directory: string };
+    create(
+      agent: NativeAgent,
+      input: { name: string; from: string },
+      signal?: AbortSignal,
+      onPhase?: (phase: string) => void,
+    ): Promise<{ path: string; branch: string; baseCommit: string; repositoryRoot: string }>;
+  };
+  subprocess?: {
+    spawn(spec: unknown): unknown;
+    resolveExecutable?(command: string, cwd?: string, signal?: AbortSignal): Promise<string>;
+  };
   effect(
     callback: () => void | (() => void | Promise<void>) | Promise<() => void | Promise<void>>,
   ): unknown;
@@ -97,7 +113,10 @@ export interface NativeContext {
   };
   fiber: { entry: { parent: { tree: { import(name: string): Promise<unknown> } } } };
   tools: {
-    register(definition: ToolDefinition): () => void;
+    register(
+      definition: ToolDefinition,
+      options?: { when?: () => boolean | Promise<boolean> },
+    ): () => void;
     restrict(filter: { allow: string[] }): () => void;
     definitions(scope?: NativeAgent): ToolDefinition[];
   };
@@ -182,6 +201,7 @@ export interface NativeSkillProvider {
   dispose(): Promise<void>;
 }
 export interface NativeModules {
+  isLlmFailure?(error: unknown): boolean;
   setSandboxMode(session: NativeAgent['session'], mode: 'danger-full-access'): void;
   defineTool(options: unknown): ToolDefinition;
   FileSystemSkillProvider: new (
@@ -203,11 +223,13 @@ export async function loadNativeModules(ctx: NativeContext): Promise<NativeModul
     tree.import('@deepseek-ai/dsh-skill-filesystem'),
     tree.import('@deepseek-ai/dsh-skill'),
     tree.import('@deepseek-ai/dsh-sandbox-policy'),
+    tree.import('@deepseek-ai/dsh-llm'),
   ]);
   const tools = results[0] as Pick<NativeModules, 'defineTool'>;
   const filesystem = results[1] as Pick<NativeModules, 'FileSystemSkillProvider'>;
   const skills = results[2] as Pick<NativeModules, 'renderSkillContent'>;
   const policy = results[3] as Pick<NativeModules, 'setSandboxMode'>;
+  const llm = results[4] as { LlmError?: new (...args: never[]) => Error };
   if (
     typeof tools.defineTool !== 'function' ||
     typeof filesystem.FileSystemSkillProvider !== 'function' ||
@@ -215,5 +237,11 @@ export async function loadNativeModules(ctx: NativeContext): Promise<NativeModul
     typeof policy.setSandboxMode !== 'function'
   )
     throw new Error('当前DSH缺少已核对的工具或Skill原生接口');
-  return { ...tools, ...filesystem, ...skills, setSandboxMode: policy.setSandboxMode };
+  return {
+    ...tools,
+    ...filesystem,
+    ...skills,
+    setSandboxMode: policy.setSandboxMode,
+    isLlmFailure: (error) => typeof llm.LlmError === 'function' && error instanceof llm.LlmError,
+  };
 }

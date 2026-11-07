@@ -5,9 +5,13 @@ const within = (root: string, path: string) => {
   const rest = relative(root, path);
   return rest !== '..' && !rest.startsWith('..' + sep) && !isAbsolute(rest);
 };
-export function ensureMaterialRoot(projectRoot: string, code: string): string {
+export function expectedMaterialRoot(projectRoot: string, code: string): string {
   if (!/^P\d{3}(?:SP)?-[A-Z]{1,16}-\d{3}(?:-[a-z])?$/.test(code))
     throw new ProjectError('INVALID_MATERIAL_CODE', '材料入口必须使用系统分配的稳定票号');
+  return join(realpathSync(projectRoot), '.TEAM', '票据材料', code);
+}
+export function ensureMaterialRoot(projectRoot: string, code: string): string {
+  expectedMaterialRoot(projectRoot, code);
   const root = realpathSync(projectRoot);
   let current = root;
   for (const name of ['.TEAM', '票据材料', code]) {
@@ -88,4 +92,39 @@ export function materialFile(root: string, path: string): string {
 }
 export function readMaterial(root: string, path: string): Buffer {
   return readFileSync(materialFile(root, path));
+}
+export function ensureLocalCommitMaterial(
+  projectRoot: string,
+  id: string,
+  sessionId: string,
+): string {
+  if (!/^[0-9a-f-]{36}$/i.test(id) || !/^[0-9a-f-]{36}$/i.test(sessionId))
+    throw new ProjectError('INVALID_MATERIAL_DOMAIN', '本地提交材料须有真实安排及会话身份');
+  const root = realpathSync(projectRoot);
+  let current = root;
+  for (const part of ['.TEAM', '本地提交材料', id, sessionId]) {
+    current = join(current, part);
+    if (existsSync(current)) {
+      const stat = lstatSync(current);
+      if (stat.isSymbolicLink() || !stat.isDirectory())
+        throw new ProjectError('MATERIAL_LINK', '提交材料目录存在链接或异常文件');
+    } else mkdirSync(current);
+  }
+  return materialDirectory(root, relative(root, current));
+}
+
+export function ensureMergeMaterial(projectRoot: string, id: string, sessionId: string): string {
+  if (!/^[0-9a-f-]{36}$/i.test(id) || !/^[0-9a-f-]{36}$/i.test(sessionId))
+    throw new ProjectError('INVALID_MATERIAL_DOMAIN', '本地合入材料须有真实安排及会话身份');
+  const root = realpathSync(projectRoot);
+  let current = root;
+  for (const part of ['.TEAM', '本地合入材料', id, sessionId]) {
+    current = join(current, part);
+    if (existsSync(current)) {
+      const stat = lstatSync(current);
+      if (stat.isSymbolicLink() || !stat.isDirectory())
+        throw new ProjectError('MATERIAL_LINK', '合入材料目录存在链接或异常文件');
+    } else mkdirSync(current);
+  }
+  return materialDirectory(root, relative(root, current));
 }

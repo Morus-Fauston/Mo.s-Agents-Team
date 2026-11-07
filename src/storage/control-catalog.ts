@@ -19,12 +19,17 @@ import type {
 import type { WorkbenchActor } from '../contracts/workbench.ts';
 import { executionSchema } from '../contracts/execution.ts';
 import type { ExecutionRecord } from '../contracts/execution.ts';
+import { scopeAdjustmentInputSchema } from '../contracts/execution.ts';
+import { decisionRequestSchema } from '../contracts/decision-requests.ts';
+import { normalizeWriteScopes, withinPath } from '../services/write-scopes.ts';
 import type { WorkbenchCatalog } from './workbench-catalog.ts';
 import type { ExecutionCatalog } from './execution-catalog.ts';
 import type { SessionCatalog } from './session-catalog.ts';
 import type { NativeEvent } from '../host/native.ts';
 import { transaction } from './transaction.ts';
 import { ProjectError } from '../services/errors.ts';
+import type { AssistantControlCatalog } from './assistant-control-catalog.ts';
+import { collaborationWaitSchema } from '../contracts/collaboration-results.ts';
 const now = () => new Date().toISOString();
 export function migrateControls(db: DatabaseSync): void {
   db.exec(`CREATE TABLE execution_control(id TEXT PRIMARY KEY,operation_id TEXT NOT NULL UNIQUE,request_hash TEXT NOT NULL,execution_id TEXT NOT NULL REFERENCES execution(id),revision INTEGER NOT NULL,data TEXT NOT NULL,UNIQUE(execution_id,revision));
@@ -38,16 +43,19 @@ export class ControlCatalog {
   private readonly wb: WorkbenchCatalog;
   private readonly executions: ExecutionCatalog;
   private readonly sessions: SessionCatalog;
+  private readonly assistantControls: AssistantControlCatalog | undefined;
   constructor(
     db: DatabaseSync,
     wb: WorkbenchCatalog,
     executions: ExecutionCatalog,
     sessions: SessionCatalog,
+    assistantControls?: AssistantControlCatalog,
   ) {
     this.db = db;
     this.wb = wb;
     this.executions = executions;
     this.sessions = sessions;
+    this.assistantControls = assistantControls;
   }
   private emit(kind: string, id: string): void {
     this.db.prepare('INSERT INTO ui_event(kind,object_id) VALUES(?,?)').run(kind, id);
@@ -76,6 +84,21 @@ export class ControlCatalog {
       .prepare('SELECT data FROM execution_control WHERE execution_id=? ORDER BY revision')
       .all(executionId)
       .map((row) => controlSchema.parse(JSON.parse(String(row.data))));
+  }
+  publicList(executionId: string) {
+    return this.list(executionId).map((value) => {
+      if (!value.observation?.checkpoint) return value;
+      const { checkpoint, ...observation } = value.observation;
+      return {
+        ...value,
+        observation,
+        checkpointSummary: {
+          files: checkpoint.files.length,
+          norms: checkpoint.norms.length,
+          writeScopes: checkpoint.writeScopes,
+        },
+      };
+    });
   }
   revision(executionId: string): number {
     return Number(
@@ -236,6 +259,7 @@ export class ControlCatalog {
         content: input.content,
         stopMode: input.action === 'soft-stop' ? 'soft' : input.stopMode,
         revision: input.expectedRevision + 1,
+        assistantTargetIds: [],
         status: 'requested',
         goal: null,
         cancel: null,
@@ -245,6 +269,7 @@ export class ControlCatalog {
         messageId: randomUUID(),
         resumeMessageId: randomUUID(),
         resumeSnapshot: null,
+        reviewedRecoveryFingerprint: input.reviewedRecoveryFingerprint ?? null,
         epoch,
         createdAt: now(),
         updatedAt: now(),
@@ -261,7 +286,23 @@ export class ControlCatalog {
           value.revision,
           JSON.stringify(value),
         );
+      value.assistantTargetIds = this.assistantControls?.capture(value) ?? [];
+      if (value.assistantTargetIds.length) this.saveControl(value);
       if (['soft-stop', 'hard-stop', 'terminate'].includes(input.action)) {
+        for (const row of this.db
+          .prepare(
+            "SELECT data FROM collaboration_wait WHERE execution_id=? AND state IN('waiting','unknown')",
+          )
+          .all(execution.id)) {
+          const wait = collaborationWaitSchema.parse(JSON.parse(String(row.data)));
+          wait.state = 'controlled';
+          wait.supersededByControlId = value.id;
+          wait.error = '原等待已被明确执行控制取代，不自动解除控制';
+          wait.updatedAt = now();
+          this.db
+            .prepare('UPDATE collaboration_wait SET state=?,data=? WHERE id=?')
+            .run(wait.state, JSON.stringify(wait), wait.id);
+        }
         execution.writeOccupancy = 'pending-release';
         if (
           input.action === 'hard-stop' ||
@@ -339,6 +380,7 @@ export class ControlCatalog {
       messageId: randomUUID(),
       resumeMessageId: randomUUID(),
       resumeSnapshot: { mode: 'review-result-only', resultId, previousControlId: previous.id },
+      reviewedRecoveryFingerprint: null,
       createdAt: now(),
       updatedAt: now(),
     });
@@ -547,6 +589,7 @@ export class ControlCatalog {
         value.cancel?.state === 'confirmed' ||
         value.cancel?.state === 'unnecessary';
       const stopped =
+        (this.assistantControls?.quiet(value.assistantTargetIds) ?? true) &&
         handoffReady &&
         goalReady &&
         cancelReady &&
@@ -556,6 +599,12 @@ export class ControlCatalog {
         observation.processesComplete &&
         allJobs;
       value.observation = observation;
+      if (
+        value.action !== 'reconcile' &&
+        value.status === 'stopped' &&
+        execution.writeOccupancy === 'released'
+      )
+        return;
       value.status = stopped
         ? 'stopped'
         : observation.agentIdle === false ||
@@ -564,6 +613,18 @@ export class ControlCatalog {
           ? 'checking'
           : 'unknown';
       const latest = this.activeControl(execution.id);
+      if (value.action === 'reconcile') {
+        // Observation alone cannot create a pause or release active/review work.
+        // An existing stop retains its own Goal, cancel, handoff and helper gates.
+        this.saveControl(value);
+        if (
+          latest &&
+          latest.revision < value.revision &&
+          ['soft-stop', 'hard-stop', 'terminate'].includes(latest.action)
+        )
+          this.observeStopped(latest.id, observation);
+        return;
+      }
       const waitingResume =
         latest?.action === 'resume' &&
         latest.status === 'requested' &&
@@ -623,6 +684,7 @@ export class ControlCatalog {
     snapshot: unknown,
     epoch: string,
     guard: (execution: ExecutionRecord) => void,
+    currentDependencies?: ExecutionRecord['dependencyEvidence'],
   ): ExecutionRecord {
     return transaction(this.db, () => {
       const value = this.get(id),
@@ -645,6 +707,7 @@ export class ControlCatalog {
       execution.lifecycleState = 'active';
       execution.writeOccupancy = 'held';
       execution.failure = null;
+      if (currentDependencies) execution.dependencyEvidence = currentDependencies;
       execution.startupState = execution.confirmedAt ? 'confirmed' : 'starting';
       if (execution.sessionId) {
         this.sessions.communicationState(execution.sessionId, 'active');
@@ -671,6 +734,127 @@ export class ControlCatalog {
         this.saveExecution(execution);
       }
       this.saveControl(value);
+    });
+  }
+  resumeDeclined(id: string, note: string): void {
+    transaction(this.db, () => {
+      const value = this.get(id);
+      if (value.action !== 'resume' || value.resumeSnapshot !== null) return;
+      value.status = 'failed';
+      value.goal = { state: 'failed', note };
+      this.saveControl(value);
+    });
+  }
+  adjustScope(
+    actor: WorkbenchActor,
+    raw: unknown,
+    guard: (execution: ExecutionRecord, scopes: string[]) => void,
+  ) {
+    const input = scopeAdjustmentInputSchema.parse(raw),
+      author = this.wb.author(actor),
+      requestHash = createHash('sha256').update(JSON.stringify({ actor, input })).digest('hex');
+    return transaction(this.db, () => {
+      const e = this.executions.get(input.executionId);
+      if (
+        actor.kind !== 'session' ||
+        author.roleType !== 'supervisor' ||
+        !e.managerSessionIds.includes(actor.sessionId) ||
+        this.sessions.get(actor.sessionId).communicationState !== 'active'
+      )
+        throw new ProjectError('SCOPE_MANAGER_REQUIRED', '只有原执行管理入口可明确调整声明写域');
+      const prior = e.scopeAdjustments.find((item) => item.operationId === input.operationId);
+      if (prior) {
+        if (prior.requestHash !== requestHash)
+          throw new ProjectError('SCOPE_OPERATION_CONFLICT', '范围调整操作身份已绑定原正文');
+        return prior;
+      }
+      if (
+        this.revision(e.id) !== input.expectedControlRevision ||
+        e.scopeAdjustments.length !== input.expectedScopeRevision
+      )
+        throw new ProjectError('SCOPE_REVISION_CHANGED', '控制或写域修订已变化，先核对原记录');
+      const last = this.activeControl(e.id),
+        stop = this.list(e.id).findLast((value) =>
+          ['soft-stop', 'hard-stop'].includes(value.action),
+        );
+      if (
+        !stop ||
+        stop.status !== 'stopped' ||
+        (last?.id !== stop.id &&
+          !(
+            last?.action === 'resume' &&
+            last.status === 'failed' &&
+            last.resumeSnapshot === null
+          )) ||
+        e.lifecycleState !== 'paused' ||
+        e.writeOccupancy !== 'released' ||
+        e.waitingReviewId ||
+        e.mergeId
+      )
+        throw new ProjectError(
+          'SCOPE_STOP_REQUIRED',
+          '普通执行仅可在确认停稳、范围已释放且无待办恢复时调整；原合入沿其正式交接',
+        );
+      const scopes = normalizeWriteScopes(e.cwd, input.writeScopes);
+      if (JSON.stringify(scopes) === JSON.stringify(normalizeWriteScopes(e.cwd, e.writeScopes)))
+        throw new ProjectError('SCOPE_UNCHANGED', '写域没有变化，不重复登记范围批准');
+      const expands = scopes.some(
+        (scope) => !e.writeScopes.some((before) => withinPath(before, scope)),
+      );
+      if (expands) {
+        const row =
+          input.decisionRequestId &&
+          this.db
+            .prepare('SELECT data FROM decision_request WHERE id=?')
+            .get(input.decisionRequestId);
+        const decision = row
+          ? decisionRequestSchema.parse(JSON.parse(String(row.data)))
+          : undefined;
+        if (
+          !decision ||
+          decision.executionId !== e.id ||
+          decision.ticketId !== e.ticketId ||
+          decision.requester.sessionId !== e.sessionId ||
+          decision.managerSessionId !== actor.sessionId ||
+          decision.reason !== 'scope-change' ||
+          decision.state !== 'answered' ||
+          decision.reply?.choice !== 'accept' ||
+          decision.reply.restrictions.trim() ||
+          !(
+            decision.reply.author.sessionId === actor.sessionId ||
+            (decision.assignee.kind === 'user' && decision.reply.author.kind === 'user')
+          ) ||
+          decision.scopeProposal?.scopeRevision !== input.expectedScopeRevision ||
+          decision.scopeProposal.cwd !== e.cwd ||
+          JSON.stringify(decision.scopeProposal.writeScopes) !== JSON.stringify(scopes)
+        )
+          throw new ProjectError(
+            'SCOPE_APPROVAL_REQUIRED',
+            '扩围须有本次执行和当前写域修订的正式决定，批准路径须与新范围完全一致',
+          );
+      } else if (input.decisionRequestId) {
+        throw new ProjectError('SCOPE_APPROVAL_UNNECESSARY', '收窄沿原授权办理，不附无关决定');
+      }
+      guard(e, scopes);
+      const adjustment = {
+        operationId: input.operationId,
+        requestHash,
+        revision: e.scopeAdjustments.length + 1,
+        stoppedControlId: stop.id,
+        controlRevision: input.expectedControlRevision,
+        before: e.writeScopes,
+        after: scopes,
+        actor: author,
+        reason: input.reason,
+        decisionRequestId: input.decisionRequestId ?? null,
+        at: now(),
+      };
+      e.writeScopes = scopes;
+      e.writeScopesDefaulted = false;
+      e.scopeAdjustments.push(adjustment);
+      this.saveExecution(e);
+      this.emit('control-changed', e.id);
+      return adjustment;
     });
   }
   project(): ProjectRuntime {

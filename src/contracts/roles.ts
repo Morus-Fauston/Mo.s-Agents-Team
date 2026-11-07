@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { executionConfigurationSchema } from './project.ts';
+import { fallbackPolicySchema } from './model-policy.ts';
 export const workflowTypeSchema = z.enum([
   'supervisor',
   'developer',
@@ -16,6 +17,7 @@ export const roleInputSchema = z
     name: z.string().trim().min(1).max(160),
     type: workflowTypeSchema,
     configuration: executionConfigurationSchema,
+    fallback: fallbackPolicySchema.default({ enabled: false, configuration: null }),
     allowChildAgents: z.boolean().default(false),
     soul: z.string().optional(),
     agent: z.string().optional(),
@@ -27,6 +29,7 @@ export const registeredRoleSchema = z.object({
   name: z.string(),
   type: workflowTypeSchema,
   configuration: executionConfigurationSchema,
+  fallback: fallbackPolicySchema.default({ enabled: false, configuration: null }),
   allowChildAgents: z.literal(false),
   aliases: z.array(z.string()),
   paths: z.object({ soul: z.string(), agent: z.string() }),
@@ -38,6 +41,7 @@ export const roleUpdateSchema = z
   .object({
     name: z.string().trim().min(1).max(160).optional(),
     configuration: executionConfigurationSchema.optional(),
+    fallback: fallbackPolicySchema.optional(),
   })
   .strict();
 export type RoleUpdate = z.infer<typeof roleUpdateSchema>;

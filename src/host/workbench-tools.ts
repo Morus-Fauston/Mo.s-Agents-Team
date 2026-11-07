@@ -4,6 +4,8 @@ import type { ProjectConnection } from '../services/project.ts';
 import type { WorkflowType } from '../contracts/roles.ts';
 import { nativeToolParameters } from './tool-parameters.ts';
 import { ProjectError } from '../services/errors.ts';
+import { versionReports } from '../services/version-reports.ts';
+import { ticketDeliveries } from '../services/ticket-deliveries.ts';
 import { messageIdentity } from '../services/message-presentation.ts';
 import {
   feedbackInputSchema,
@@ -14,6 +16,11 @@ import {
   ticketStateSchema,
   phaseInputSchema,
   categoryInputSchema,
+  planInputSchema,
+  ticketInputSchema,
+  researchQuestionInputSchema,
+  researchQuestionUpdateSchema,
+  researchAnswerBodySchema,
 } from '../contracts/workbench.ts';
 type Execution = { agent?: NativeAgent; callId: string; signal: AbortSignal };
 function encode(value: unknown): string {
@@ -112,6 +119,7 @@ export function installWorkbenchTools(
             id: item.id,
             code: item.code,
             title: item.title,
+            kind: item.kind,
             state: item.state,
             goalPreview: item.goal.slice(0, 160),
             goalPreviewComplete: item.goal.length <= 160,
@@ -123,7 +131,7 @@ export function installWorkbenchTools(
   );
   register(
     'mat_ticket',
-    '按准确票号或ID读取同源票据。section选择overview、body、checklist、log-index、log、revisions、log-history或materials；全文分段读取，不把目录当正文。',
+    '按准确票号或ID读取同源票据。section选择overview、body、checklist、log-index、log、revisions、log-history、materials或research；research可按questionId逐题读，独审带原versionId固定读取。全文分段读取，不把目录当正文。',
     z
       .object({
         ticket,
@@ -137,9 +145,15 @@ export function installWorkbenchTools(
             'revisions',
             'log-history',
             'materials',
+            'research',
           ])
           .default('overview'),
         logId: z.string().optional(),
+        questionId: z
+          .string()
+          .regex(/^Q\d{2,}$/)
+          .optional(),
+        versionId: z.uuid().optional(),
         archiveMode: z.enum(['active', 'archived', 'all']).default('active'),
         offset,
       })
@@ -148,10 +162,14 @@ export function installWorkbenchTools(
       const catalog = wb(),
         value = catalog.getTicket(input.ticket);
       let content: unknown;
+      if (input.versionId && input.section !== 'research')
+        throw new ProjectError('RESEARCH_VERSION_SECTION', '固定研究版本只能用于research入口');
       switch (input.section) {
         case 'body':
           content = {
             title: value.title,
+            kind: value.kind,
+            researchBody: value.research?.body ?? null,
             goal: value.goal,
             included: value.included,
             excluded: value.excluded,
@@ -159,6 +177,73 @@ export function installWorkbenchTools(
             revision: value.revision,
           };
           break;
+        case 'research': {
+          if (input.versionId) {
+            const version = binding().connection.versions().get(input.versionId);
+            if (
+              version.ticket.id !== value.id ||
+              version.ticket.kind !== 'research' ||
+              !version.ticket.research
+            )
+              throw new ProjectError('RESEARCH_VERSION_SCOPE', '固定版本不属于原研究票');
+            const questions = input.questionId
+              ? version.ticket.research.questions.filter((q) => q.id === input.questionId)
+              : version.ticket.research.questions;
+            if (input.questionId && !questions.length)
+              throw new ProjectError('RESEARCH_QUESTION_NOT_FOUND', '固定版本没有此QXX问题');
+            content = {
+              versionId: version.id,
+              fixed: true,
+              reportPaths: version.reportPaths,
+              reports: versionReports(version),
+              ...(input.questionId ? {} : { body: version.ticket.research.body }),
+              entries: questions.map((question) => {
+                const answer =
+                  version.researchAnswers.find((a) => a.questionId === question.id) ?? null;
+                return input.questionId
+                  ? {
+                      question,
+                      answer,
+                      coverage: !answer
+                        ? 'unanswered'
+                        : answer.questionRevision === question.definitionRevision
+                          ? 'current'
+                          : 'outdated',
+                    }
+                  : {
+                      id: question.id,
+                      title: question.title,
+                      definitionRevision: question.definitionRevision,
+                      answerRevision: answer?.revision ?? null,
+                      status: answer?.status ?? null,
+                    };
+              }),
+              note: '报告、回答和证据来自此固定版本，不表示采纳或运行验证。',
+            };
+          } else {
+            const research = catalog.research(value.id, input.questionId);
+            content = input.questionId
+              ? {
+                  ...research,
+                  definitions: catalog.researchQuestionHistory(value.id, input.questionId),
+                  answers: catalog.researchAnswerHistory(value.id, input.questionId),
+                }
+              : {
+                  body: research.body,
+                  entries: research.entries.map((e) => ({
+                    id: e.question.id,
+                    title: e.question.title,
+                    revision: e.question.revision,
+                    definitionRevision: e.question.definitionRevision,
+                    answerRevision: e.answer?.revision ?? null,
+                    status: e.answer?.status ?? null,
+                    coverage: e.coverage,
+                  })),
+                  note: '当前记录。独审须加versionId读取原固定版本，完整题目按questionId查询。',
+                };
+          }
+          break;
+        }
         case 'checklist':
           content = value.checklist;
           break;
@@ -189,7 +274,7 @@ export function installWorkbenchTools(
             root: value.materialRoot,
             currentExecution: value.currentExecution,
             domains: catalog.materialDomains(value.id),
-            currentDelivery: null,
+            ...ticketDeliveries(binding().connection, value.id),
             note: '未有实际执行或审阅时不伪造材料域；文件工具写入仍遵守分配范围',
           };
           break;
@@ -198,6 +283,8 @@ export function installWorkbenchTools(
             id: value.id,
             code: value.code,
             title: value.title,
+            kind: value.kind,
+            researchQuestions: value.research?.questions.map((q) => q.id) ?? [],
             state: value.state,
             revision: value.revision,
             phase: catalog.getPhase(value.phaseId),
@@ -223,6 +310,64 @@ export function installWorkbenchTools(
     (input) => documentPage(wb().projectHistory(), input.offset),
   );
   register(
+    'mat_research',
+    '研究票的QXX维护与回答。question-add填entry；question-update填questionId/definition；answer填questionId/answer。问题定义仅原有权主管维护；正式回答仅本次调查主执行，辅助通过Log/材料交回由原主整合。answer.expectedQuestionRevision绑定definitionRevision，expectedAnswerRevision首次0；排序不改QXX。未确认或缺口须解释边界，不形成采纳。读取用mat_ticket section=research；整票完成须reportPaths指向自身材料域报告。',
+    z
+      .object({
+        ticket,
+        action: z.enum(['question-add', 'question-update', 'answer']),
+        questionId: z
+          .string()
+          .regex(/^Q\d{2,}$/)
+          .optional(),
+        entry: researchQuestionInputSchema.omit({ operationId: true }).optional(),
+        definition: researchQuestionUpdateSchema.omit({ operationId: true }).optional(),
+        answer: researchAnswerBodySchema.optional(),
+      })
+      .strict(),
+    (input, exec) => {
+      const catalog = wb(),
+        id = catalog.getTicket(input.ticket).id,
+        operationId = operation('mat_research', exec);
+      if (input.action === 'question-add') {
+        if (!input.entry || input.questionId || input.definition || input.answer)
+          throw new ProjectError('RESEARCH_INPUT', '新增问题仅填entry');
+        const q = catalog.addResearchQuestion(actor(), id, { ...input.entry, operationId });
+        return {
+          ticketId: id,
+          questionId: q.id,
+          revision: q.revision,
+          definitionRevision: q.definitionRevision,
+        };
+      }
+      if (!input.questionId || input.entry)
+        throw new ProjectError('RESEARCH_INPUT', '动作须指定原QXX，不混入entry');
+      if (input.action === 'question-update') {
+        if (!input.definition || input.answer)
+          throw new ProjectError('RESEARCH_INPUT', '更新定义须填definition');
+        const q = catalog.updateResearchQuestion(actor(), id, input.questionId, {
+          ...input.definition,
+          operationId,
+        });
+        return { questionId: q.id, revision: q.revision, definitionRevision: q.definitionRevision };
+      }
+      if (!input.answer || input.definition)
+        throw new ProjectError('RESEARCH_INPUT', '回答仅填answer');
+      const a = catalog.answerResearchQuestion(actor(), id, input.questionId, {
+        ...input.answer,
+        operationId,
+      });
+      return {
+        questionId: a.questionId,
+        questionRevision: a.questionRevision,
+        answerId: a.id,
+        revision: a.revision,
+        status: a.status,
+        note: '回答及报告不等于采纳，完整证据按QXX回读。',
+      };
+    },
+  );
+  register(
     'mat_feedback',
     '测试期提交本系统的具体问题或建议，保存后继续原工作，不等待答复；不转票、不派工、不唤醒。来源及背景由软件取得。',
     feedbackInputSchema.omit({ operationId: true }).strict(),
@@ -240,7 +385,7 @@ export function installWorkbenchTools(
       };
     },
   );
-  if (roleType === 'developer' || roleType === 'investigator') {
+  if (roleType === 'developer' || roleType === 'investigator' || roleType === 'reviewer') {
     register(
       'mat_log',
       '维护当前获准票内工作Log。action=append追加正文；metadata仅维护分类、重要性或归档，正文纠正通过corrects追加。无实际执行责任时拒绝写入。',
@@ -297,8 +442,32 @@ export function installWorkbenchTools(
   }
   if (roleType === 'supervisor') {
     register(
+      'mat_create_ticket',
+      '依据用户已确认规划创建正式票据，必须引用planId与同一期次。先读取mat_plans核对目标和范围；不接受自报批准，不开放期次或派工。',
+      ticketInputSchema.omit({ operationId: true }).extend({ planId: z.uuid() }).strict(),
+      (input, exec) => {
+        const value = wb().createTicket(actor(), {
+          ...input,
+          operationId: operation('mat_create_ticket', exec),
+        });
+        return {
+          ticketId: value.id,
+          code: value.code,
+          planId: value.planId,
+          state: value.state,
+          saved: true,
+        };
+      },
+    );
+    register(
+      'mat_plans',
+      '读取本项目规划全文和实际用户确认记录，按nextOffset读完后在已确认范围拆票。',
+      z.object({ id: z.uuid().optional(), offset }).strict(),
+      (input) => documentPage(input.id ? wb().getPlan(input.id) : wb().plans(), input.offset),
+    );
+    register(
       'mat_update_ticket',
-      '在既有授权内维护已有票据要求，必须给出当前版本和理由。正式新票由用户明确确认入口建立；不接受任意状态赋值。',
+      '在既有授权内维护已有票据要求，必须给出当前版本和理由。新票使用mat_create_ticket引用已确认规划；不接受任意状态赋值。',
       ticketUpdateSchema.omit({ operationId: true }).extend({ ticket }).strict(),
       (input, exec) => {
         const { ticket, ...update } = input,
@@ -311,20 +480,26 @@ export function installWorkbenchTools(
     );
     register(
       'mat_plan',
-      '建立未开放期次或主管定义类别。记录计划不获得开工授权，开放期次只接受用户入口。',
+      '保存规划全文、建立未开放期次或主管定义类别，每次一种动作。规划须经用户确认后才能据此建票；保存不获得开工授权。',
       z
         .object({
           phase: phaseInputSchema.omit({ operationId: true }).optional(),
           category: categoryInputSchema.omit({ operationId: true }).optional(),
+          plan: planInputSchema.omit({ operationId: true }).optional(),
         })
         .strict(),
       (input, exec) => {
-        if ((input.phase === undefined) === (input.category === undefined))
-          throw new ProjectError('ONE_PLAN_ACTION', '每次只建立一个明确期次或类别');
+        if (
+          [input.phase, input.category, input.plan].filter((value) => value !== undefined)
+            .length !== 1
+        )
+          throw new ProjectError('ONE_PLAN_ACTION', '每次只保存一个规划、期次或类别');
         const operationId = operation('mat_plan', exec),
-          value = input.phase
-            ? wb().createPhase(actor(), { ...input.phase, operationId })
-            : wb().createCategory(actor(), { ...input.category, operationId });
+          value = input.plan
+            ? wb().savePlan(actor(), { ...input.plan, operationId })
+            : input.phase
+              ? wb().createPhase(actor(), { ...input.phase, operationId })
+              : wb().createCategory(actor(), { ...input.category, operationId });
         return { id: value.id, saved: true };
       },
     );

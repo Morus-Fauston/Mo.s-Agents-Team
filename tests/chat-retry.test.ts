@@ -8,7 +8,87 @@ import { CommunicationService } from '../src/services/chat-service.ts';
 import { createApplication } from '../src/api/application.ts';
 import { presentMessage } from '../src/services/message-presentation.ts';
 import { ExplicitSkillGrants } from '../src/host/explicit-skills.ts';
-import type { NativeAgent, NativeMessage } from '../src/host/native.ts';
+import type { NativeAgent, NativeEvent, NativeMessage } from '../src/host/native.ts';
+
+test('恢复仅补回有完整原生未入模型证明的原输入；缺件、已开始步骤均保留未知', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'mat-unstarted-'));
+  const projectRoot = join(root, 'project');
+  mkdirSync(projectRoot);
+  const projects = new ProjectService(join(root, 'state'));
+  const project = projects.create({
+    root: projectRoot,
+    name: '恢复单测',
+    supervisor: { provider: 'unit', model: 'unit' },
+  });
+  const c = projects.forProject(project.id);
+  const session = c.reserveSession({
+    roleId: project.roles[0]!.id,
+    name: '原入口',
+    purpose: '不代表真实Host',
+    cwd: projectRoot,
+  });
+  c.bindSession(session.id, 'unit-native');
+  const saved = c
+    .messages()
+    .save(
+      { kind: 'user' },
+      { id: randomUUID(), target: session.id, content: '原文副作用不得重复' },
+    );
+  c.messages().beginDelivery(saved.message.id);
+  c.messages().recordMemoryAccepted(saved.message.id);
+  c.messages().recordDurableAccepted(saved.message.id);
+  const message = presentMessage(saved),
+    inbox: NativeMessage[] = [];
+  const events: NativeEvent[] = [
+    {
+      type: 'agent/inbox/spliced',
+      seq: 0,
+      data: { target: 'next-step', start: 0, inserted: [message] },
+    },
+    { type: 'turn/start', seq: 1, data: { turn: 1 } },
+    {
+      type: 'agent/inbox/spliced',
+      seq: 2,
+      data: { target: 'next-step', start: 0, removedCount: 1, inserted: [] },
+    },
+    { type: 'turn/end', seq: 3, data: { turn: 1, reason: { kind: 'aborted' } } },
+  ];
+  let snapshot: NativeEvent[] = [];
+  const agent = {
+    id: 'unit-native',
+    status: 'idle',
+    session: { deriveMessages: () => [], snapshotEvents: () => snapshot },
+    inbox: { nextStep: inbox },
+    inject: (m: NativeMessage) => inbox.push(m),
+  } as unknown as NativeAgent;
+  const communication = new CommunicationService(projects, {
+    open: async () => agent,
+    flush: async () => true,
+  });
+  try {
+    await expect(communication.prepareResume(project.id, session.id, agent)).rejects.toMatchObject({
+      code: 'NATIVE_MESSAGE_UNCONFIRMED',
+    });
+    snapshot = [
+      ...events.slice(0, 3),
+      { type: 'step/start', seq: 3, data: { turn: 1, step: 1 } },
+      { ...events[3]!, seq: 4 },
+    ];
+    await expect(communication.prepareResume(project.id, session.id, agent)).rejects.toMatchObject({
+      code: 'NATIVE_MESSAGE_UNCONFIRMED',
+    });
+    expect(inbox).toHaveLength(0);
+    snapshot = events;
+    await communication.prepareResume(project.id, session.id, agent);
+    await communication.prepareResume(project.id, session.id, agent);
+    expect(inbox).toEqual([message]);
+    expect(c.messages().get(saved.message.id).receipt.enteredAt).toBeNull();
+  } finally {
+    await communication.close();
+    projects.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('持久回执丢失后按原消息核对，文件变化不重建已保存引用，已进入请求绝不重投', async () => {
   const root = mkdtempSync(join(tmpdir(), 'mat-retry-'));

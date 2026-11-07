@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
@@ -109,6 +109,360 @@ function fixture() {
     },
   };
 }
+
+test('只读核对不暂停活跃或审阅等待；已有停止只补原控制证据，不绕过回报', () => {
+  const f = fixture();
+  const quiet = {
+    agentIdle: true,
+    inFlightTools: false,
+    filesStable: true,
+    fileFingerprint: 'unit',
+    processesComplete: true,
+    jobObservations: [],
+    note: '原生边界合成证明',
+  };
+  try {
+    const c = f.controls,
+      request = (action: 'reconcile' | 'hard-stop') =>
+        c.request(
+          f.user,
+          {
+            operationId: randomUUID(),
+            executionId: f.execution.id,
+            action,
+            expectedRevision: c.revision(f.execution.id),
+            reason: '核对',
+          },
+          f.epoch,
+        );
+    for (const waiting of [false, true]) {
+      if (waiting) f.connection.executions().waitForReview(f.execution.id, randomUUID());
+      const before = f.connection.executions().get(f.execution.id),
+        session = f.connection.session(f.session.id);
+      const read = request('reconcile');
+      c.receipt(read.id, 'goal', { state: 'confirmed', note: '只读观察' });
+      c.receipt(read.id, 'cancel', { state: 'unnecessary', note: '未取消' });
+      c.observeStopped(read.id, quiet);
+      expect(f.connection.executions().get(f.execution.id)).toEqual(before);
+      expect(f.connection.session(f.session.id)).toEqual(session);
+    }
+    const stale = request('reconcile');
+    c.receipt(stale.id, 'goal', { state: 'confirmed', note: '停止前的旧采样' });
+    c.receipt(stale.id, 'cancel', { state: 'unnecessary', note: '未取消' });
+    const stop = request('hard-stop');
+    c.receipt(stop.id, 'goal', { state: 'confirmed', note: '原Goal已暂停' });
+    c.receipt(stop.id, 'cancel', { state: 'confirmed', note: '原cancel已调用' });
+    c.observeStopped(stop.id, { ...quiet, filesStable: null });
+    expect(c.get(stop.id).status).toBe('unknown');
+    const beforeLate = f.connection.executions().get(f.execution.id);
+    c.observeStopped(stale.id, quiet);
+    expect(c.get(stop.id).status).toBe('unknown');
+    expect(f.connection.executions().get(f.execution.id)).toEqual(beforeLate);
+    const read = request('reconcile');
+    c.receipt(read.id, 'goal', { state: 'confirmed', note: '观察' });
+    c.receipt(read.id, 'cancel', { state: 'unnecessary', note: '未再取消' });
+    c.observeStopped(read.id, quiet);
+    expect(c.get(stop.id).status).toBe('stopped');
+    expect(f.connection.executions().get(f.execution.id).writeOccupancy).toBe('released');
+  } finally {
+    f.close();
+  }
+});
+
+test('停稳交接保留原件；新票占用接走的路径，原执行收窄后只有原主管核对确切差异才能恢复原Goal', async () => {
+  const f = fixture(),
+    c = f.connection,
+    project = c.snapshot().id;
+  const manager = { kind: 'session' as const, sessionId: f.manager.id };
+  const kept = join(f.root, 'kept'),
+    handed = join(f.root, 'handed'),
+    file = join(kept, 'source.txt');
+  mkdirSync(kept);
+  mkdirSync(handed);
+  writeFileSync(file, 'old original bytes');
+  writeFileSync(join(handed, 'source.txt'), 'handoff origin');
+  const goal: NativeGoalView = {
+    id: 'unit-goal',
+    revision: 2,
+    objective: '原目标',
+    phase: 'paused',
+    activation: 'disarmed',
+    roundsStarted: 1,
+    maxGoalRounds: 2,
+  };
+  let resumed = 0,
+    prepared = 0;
+  const agent = {
+    id: 'unit-executor',
+    status: 'idle',
+    session: { snapshotEvents: () => [], deriveMessages: () => [] },
+    steer: () => {},
+  } as unknown as NativeAgent;
+  const native = {
+    workingDirectory: { get: () => f.root },
+    jobs: { list: () => [] },
+    sessions: { flush: async () => true },
+    goals: {
+      get: () => goal,
+      edit: (_agent: NativeAgent, _expected: unknown, value: { objective: string }) =>
+        Object.assign(goal, value),
+      resume: () => {
+        resumed++;
+      },
+      disarm: () => {},
+    },
+  } as unknown as NativeContext;
+  const service = new ExecutionControlService(
+    { forProject: () => c, list: () => [{ id: project }] } as unknown as ProjectService,
+    {
+      epoch: f.epoch,
+      context: () => ({ message: { content: [{ text: '复核后的目标' }] } }),
+    } as unknown as DispatchService,
+    {
+      prepareResume: async () => {
+        prepared++;
+      },
+    } as unknown as CommunicationService,
+    {
+      native,
+      peek: () => agent,
+      openControlled: async () => agent,
+      freshContext: async () => ({ cwd: f.root }),
+    },
+  );
+  try {
+    const wb = c.workbench();
+    const newTicket = wb.createTicket(f.user, {
+      operationId: randomUUID(),
+      title: '接走独立范围',
+      phaseId: f.ticket.phaseId,
+      categoryId: f.ticket.categoryId,
+      goal: '正式接走一段',
+      included: '独立路径',
+      excluded: '其他路径',
+      conditions: [{ condition: '范围独立', verification: 'automated' }],
+    });
+    const dispatch = {
+      operationId: randomUUID(),
+      ticket: newTicket.id,
+      roleId: f.execution.roleId,
+      name: '接走范围',
+      cwd: f.root,
+      writeScopes: [handed],
+    };
+    expect(() => c.executions().register(manager, dispatch, f.epoch)).toThrow(/冲突/);
+    const stop = f.controls.request(
+      f.user,
+      {
+        operationId: randomUUID(),
+        executionId: f.execution.id,
+        action: 'hard-stop',
+        reason: '单测交接',
+        expectedRevision: 0,
+      },
+      f.epoch,
+    );
+    const change = {
+      executionId: f.execution.id,
+      operationId: randomUUID(),
+      expectedControlRevision: 1,
+      expectedScopeRevision: 0,
+      writeScopes: [kept],
+      reason: '原主管明确留下独立范围',
+    };
+    expect(() => service.adjustScope(project, manager, change)).toThrow(/停稳/);
+    f.controls.receipt(stop.id, 'goal', { state: 'confirmed', note: '合成原Goal已停' });
+    f.controls.receipt(stop.id, 'cancel', { state: 'confirmed', note: '合成取消已确认' });
+    // Invoke the real file/norm sampling code with a synthetic native handle.
+    const sampled = await service.inspectExecution(
+      project,
+      f.execution.id,
+      agent,
+      undefined,
+      false,
+      true,
+    );
+    expect(sampled.checkpoint).toBeDefined();
+    f.controls.observeStopped(stop.id, sampled);
+    expect(f.controls.get(stop.id).status).toBe('stopped');
+    expect(service.recoveryPreview(project, f.execution.id).hasChanges).toBe(false);
+    const owner = c.executions().register(manager, dispatch, f.epoch).record;
+    expect(owner.writeOccupancy).toBe('held');
+    const rejected = service.request(project, f.user, {
+      operationId: randomUUID(),
+      executionId: f.execution.id,
+      expectedRevision: 1,
+      action: 'resume',
+      reason: '原范围仍会撞上新票',
+    });
+    await expect.poll(() => f.controls.get(rejected.id).status).toBe('failed');
+    expect(c.executions().get(f.execution.id).writeOccupancy).toBe('released');
+    const adjustment = service.adjustScope(project, manager, {
+      ...change,
+      expectedControlRevision: 2,
+    });
+    expect(adjustment.before).toEqual([f.root]);
+    expect(adjustment.after).toEqual([kept]);
+    expect(adjustment.stoppedControlId).toBe(stop.id);
+    const before = sampled.checkpoint?.files.find((item) => item.path === file)?.sha256;
+    expect(readFileSync(join(c.versions().storage, 'sha256', before!), 'utf8')).toBe(
+      'old original bytes',
+    );
+    writeFileSync(file, 'after handoff');
+    writeFileSync(join(handed, 'source.txt'), 'new owner changes this');
+    const current = service.recoveryPreview(project, f.execution.id);
+    expect(current.scopeChanged).toBe(true);
+    expect(current.files.map((item) => item.path)).toEqual([file]);
+    const denied = service.request(project, f.user, {
+      operationId: randomUUID(),
+      executionId: f.execution.id,
+      expectedRevision: 2,
+      action: 'resume',
+      reason: '非原主管不能代替核定变化',
+      reviewedRecoveryFingerprint: current.fingerprint,
+    });
+    await expect.poll(() => f.controls.get(denied.id).status).toBe('failed');
+    expect(prepared).toBe(0);
+    expect(resumed).toBe(0);
+    const approved = service.recoveryPreview(project, f.execution.id);
+    const accepted = service.request(project, manager, {
+      operationId: randomUUID(),
+      executionId: f.execution.id,
+      expectedRevision: 3,
+      action: 'resume',
+      reason: '原主管明确认可差异且仅恢复收窄范围',
+      reviewedRecoveryFingerprint: approved.fingerprint,
+    });
+    await expect.poll(() => f.controls.get(accepted.id).goal?.state).toBe('confirmed');
+    expect(resumed).toBe(1);
+    expect(c.executions().get(f.execution.id)).toMatchObject({
+      goalId: 'unit-goal',
+      writeScopes: [kept],
+      writeOccupancy: 'held',
+    });
+    expect(c.executions().get(owner.id).writeOccupancy).toBe('held');
+    expect(readFileSync(join(c.versions().storage, 'sha256', before!), 'utf8')).toBe(
+      'old original bytes',
+    );
+  } finally {
+    await service.close();
+    f.close();
+  }
+}, 20000);
+
+test('扩围只消费本次主执行的精确结构化决定，文字答复与同一批准的变体不能扩权', () => {
+  const f = fixture(),
+    c = f.connection,
+    e = f.execution,
+    manager = { kind: 'session' as const, sessionId: f.manager.id },
+    worker = { kind: 'session' as const, sessionId: f.session.id },
+    kept = join(f.root, 'kept'),
+    extra = join(f.root, 'extra');
+  try {
+    const requestStop = (revision: number) => {
+      const stop = f.controls.request(
+        f.user,
+        {
+          executionId: e.id,
+          operationId: randomUUID(),
+          expectedRevision: revision,
+          action: 'hard-stop',
+          reason: '合成控制',
+        },
+        f.epoch,
+      );
+      f.controls.receipt(stop.id, 'goal', { state: 'confirmed', note: '合成停Goal' });
+      f.controls.receipt(stop.id, 'cancel', { state: 'confirmed', note: '合成取消' });
+      f.controls.observeStopped(stop.id, {
+        agentIdle: true,
+        inFlightTools: false,
+        filesStable: true,
+        fileFingerprint: 'unit',
+        processesComplete: true,
+        jobObservations: [],
+        note: '仅事务夹具',
+      });
+      return stop;
+    };
+    requestStop(0);
+    const scope = {
+      executionId: e.id,
+      reason: '写域协调',
+      expectedControlRevision: 1,
+      expectedScopeRevision: 0,
+      operationId: randomUUID(),
+      writeScopes: [kept],
+    };
+    f.controls.adjustScope(manager, scope, () => {});
+    const resume = f.controls.request(
+      f.user,
+      {
+        executionId: e.id,
+        operationId: randomUUID(),
+        expectedRevision: 1,
+        action: 'resume',
+        reason: '事务夹具恢复',
+      },
+      f.epoch,
+    );
+    f.controls.resumeAdmitted(resume.id, {}, f.epoch, () => {});
+    const proposal = c.decisionRequests().create(worker, {
+      operationId: randomUUID(),
+      subject: '有界扩围',
+      question: '扩到额外目录',
+      impact: '扩大写域',
+      reason: 'scope-change',
+      requestedWriteScopes: [kept, extra],
+    });
+    const reply = {
+      operationId: randomUUID(),
+      expectedRevision: proposal.revision,
+      choice: 'accept',
+      answer: '同意明确目录',
+      restrictions: '',
+    };
+    expect(() =>
+      c
+        .decisionRequests()
+        .reply(manager, proposal.id, { ...reply, restrictions: '只写另一个目录' }),
+    ).toThrow(/准确的新范围/);
+    c.decisionRequests().reply(manager, proposal.id, reply);
+    const stop = requestStop(2);
+    const change = {
+      ...scope,
+      operationId: randomUUID(),
+      expectedScopeRevision: 1,
+      expectedControlRevision: 3,
+      writeScopes: [kept, extra],
+    };
+    expect(() => f.controls.adjustScope(manager, change, () => {})).toThrow(/正式决定/);
+    expect(() =>
+      f.controls.adjustScope(
+        manager,
+        { ...change, writeScopes: [f.root], decisionRequestId: proposal.id },
+        () => {},
+      ),
+    ).toThrow(/完全一致/);
+    const accepted = f.controls.adjustScope(
+      manager,
+      { ...change, decisionRequestId: proposal.id },
+      () => {},
+    );
+    expect(accepted).toMatchObject({
+      stoppedControlId: stop.id,
+      revision: 2,
+      decisionRequestId: proposal.id,
+    });
+    expect(
+      f.controls.adjustScope(manager, { ...change, decisionRequestId: proposal.id }, () => {
+        throw new Error('重放不再调整');
+      }),
+    ).toEqual(accepted);
+    expect(c.executions().get(e.id).writeOccupancy).toBe('released');
+  } finally {
+    f.close();
+  }
+});
 
 test.each(
   (['soft-stop', 'hard-stop', 'terminate', 'reconcile'] as const).flatMap((action) =>

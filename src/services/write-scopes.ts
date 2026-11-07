@@ -28,3 +28,15 @@ export function withinPath(root: string, path: string): boolean {
   return rest !== '..' && !rest.startsWith('..' + sep) && !isAbsolute(rest);
 }
 export const scopesOverlap = (a: string, b: string) => withinPath(a, b) || withinPath(b, a);
+export function normalizeWriteScopes(cwd: string, paths: string[]): string[] {
+  const scopes = [...new Set(paths.map(canonicalWriteScope))].sort();
+  if (scopes.some((path) => !withinPath(cwd, path)))
+    throw new ProjectError('WRITE_SCOPE_OUTSIDE_CWD', '协调写入范围超出本次源码工作目录');
+  return scopes.filter(
+    (path, index) =>
+      !scopes.some(
+        (other, prior) =>
+          prior !== index && withinPath(other, path) && (!withinPath(path, other) || prior < index),
+      ),
+  );
+}

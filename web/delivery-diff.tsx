@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { versionHeaderSchema } from '../src/contracts/versions';
 import { request } from './request';
 import styles from './workbench.module.css';
+import { ResearchVersion } from './research';
 const diffSchema = z.object({
   from: z.string(),
   to: z.string(),
@@ -21,16 +22,18 @@ const checkSchema = z.object({ matches: z.boolean().nullable(), error: z.string(
 export function DeliveryDiff({
   projectId,
   executionId,
+  initialVersionId = '',
 }: {
   projectId: string;
   executionId: string;
+  initialVersionId?: string;
 }) {
   const base = `/api/projects/${projectId}/executions/${executionId}/versions`,
     versions = useQuery({
       queryKey: ['versions', projectId, executionId],
       queryFn: async () => z.array(versionHeaderSchema).parse(await request(base)),
     });
-  const [selected, setSelected] = useState(''),
+  const [selected, setSelected] = useState(initialVersionId),
     [mode, setMode] = useState<'ticket' | 'repair'>('ticket'),
     [showDiff, setShowDiff] = useState(false),
     chosen = versions.data?.find((version) => version.id === selected) ?? versions.data?.at(-1);
@@ -71,6 +74,9 @@ export function DeliveryDiff({
       <p>{chosen.summary}</p>
       <p>版本ID：{chosen.id}</p>
       <p>指纹：{chosen.fingerprint}</p>
+      {chosen.kind === 'delivery' && chosen.ticketKind === 'research' && (
+        <ResearchVersion projectId={projectId} executionId={executionId} versionId={chosen.id} />
+      )}
       <div className={styles.tableWrap}>
         <table>
           <thead>

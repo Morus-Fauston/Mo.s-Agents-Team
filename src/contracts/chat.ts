@@ -15,6 +15,7 @@ export const chatInputSchema = z
     content: z.string().refine((value) => value.trim().length > 0, '消息正文不能为空'),
     replyTo: z.uuid().optional(),
     references: z.array(fileReferenceSchema).default([]),
+    allowedChecklistIds: z.array(z.string().regex(/^C\d{3,}$/)).optional(),
   })
   .strict();
 export type ChatInput = z.input<typeof chatInputSchema>;
@@ -35,6 +36,7 @@ export const chatMessageSchema = z.object({
   content: z.string(),
   replyTo: z.string().nullable(),
   references: z.array(fileReferenceSchema),
+  allowedChecklistIds: z.array(z.string()).optional(),
   savedAt: z.string(),
 });
 export const conversationSchema = z.object({

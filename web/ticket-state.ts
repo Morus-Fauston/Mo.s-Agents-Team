@@ -18,6 +18,9 @@ export const logTypeLabels = {
 } as const;
 export const importanceLabels = { normal: '一般', important: '重要', critical: '关键' } as const;
 export const historyLabels: Record<string, string> = {
+  'research-question-added': '增加研究问题',
+  'research-question-updated': '修订研究问题',
+  'research-answer-saved': '记录研究回答',
   'phase-created': '建立期次',
   'phase-updated': '修改期次记录',
   'phase-opened': '用户开放期次',

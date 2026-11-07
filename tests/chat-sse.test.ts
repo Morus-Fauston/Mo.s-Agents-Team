@@ -33,7 +33,7 @@ test('真实HTTP按事件游标重连，带活跃SSE流关闭控制台也会释�
   const projectId = connection.snapshot().id;
   connection.close();
   writeFileSync(join(state, '项目目录.json'), JSON.stringify([project]));
-  const console = await startConsole({ stateDirectory: state, port: 0 });
+  const console = await startConsole({ stateDirectory: state, projectRoot: project, port: 0 });
   try {
     const response = await fetch(console.url + `/api/projects/${projectId}/events?after=0`, {
       signal: AbortSignal.timeout(3000),

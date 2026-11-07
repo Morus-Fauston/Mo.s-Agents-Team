@@ -1,7 +1,7 @@
 import { StrictMode, useState, lazy, Suspense } from 'react';
 import type { FormEvent } from 'react';
 import { createRoot } from 'react-dom/client';
-import { BrowserRouter, Link, Route, Routes, useParams } from 'react-router';
+import { BrowserRouter, Link, Route, Routes, useParams, useSearchParams } from 'react-router';
 import {
   QueryClient,
   QueryClientProvider,
@@ -11,25 +11,33 @@ import {
 } from '@tanstack/react-query';
 import { Dialog } from 'radix-ui';
 import { z } from 'zod';
-import { projectEntrySchema, projectSchema } from '../src/contracts/project';
+import { projectSchema } from '../src/contracts/project';
 import type { ProjectView } from '../src/contracts/project';
 import styles from './workbench.module.css';
 import { request } from './request';
 import { RoleAndSessionPanel } from './roles-and-sessions';
 import { ProjectControls } from './controls';
 import { ReviewSettings } from './review-progress';
+import { projectRuntimeSchema } from '../src/contracts/controls';
+import shell from './workspace-shell.module.css';
 const ChatPanel = lazy(() => import('./chat').then((module) => ({ default: module.ChatPanel })));
+const Overview = lazy(() =>
+  import('./project-overview').then((module) => ({ default: module.ProjectOverview })),
+);
 const TicketWorkbench = lazy(() =>
   import('./workbench').then((module) => ({ default: module.TicketWorkbench })),
 );
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-function useProjects() {
+function useWorkspace() {
   return useQuery({
-    queryKey: ['projects'],
-    queryFn: async () => z.array(projectEntrySchema).parse(await request('/api/projects')),
+    queryKey: ['workspace'],
+    queryFn: async () =>
+      z
+        .object({ root: z.string(), project: projectSchema.nullable() })
+        .parse(await request('/api/workspace')),
   });
 }
-function CreateDialog({ mode }: { mode: 'create' | 'attach' }) {
+function CreateDialog({ mode, root }: { mode: 'create' | 'attach'; root: string }) {
   const [open, setOpen] = useState(false);
   const client = useQueryClient();
   const mutation = useMutation({
@@ -38,14 +46,13 @@ function CreateDialog({ mode }: { mode: 'create' | 'attach' }) {
         await request(mode === 'create' ? '/api/projects' : '/api/projects/attach', body),
       ),
     onSuccess: async () => {
-      await client.invalidateQueries({ queryKey: ['projects'] });
+      await client.invalidateQueries({ queryKey: ['workspace'] });
       setOpen(false);
     },
   });
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const data = new FormData(event.currentTarget);
-    const root = String(data.get('root') ?? '');
     mutation.mutate(
       mode === 'attach'
         ? { root }
@@ -59,7 +66,7 @@ function CreateDialog({ mode }: { mode: 'create' | 'attach' }) {
           },
     );
   }
-  const title = mode === 'create' ? '新建项目' : '接入已有项目';
+  const title = mode === 'create' ? '初始化当前项目' : '接入当前项目';
   return (
     <Dialog.Root
       open={open}
@@ -79,8 +86,8 @@ function CreateDialog({ mode }: { mode: 'create' | 'attach' }) {
           <Dialog.Title className={styles.dialogTitle}>{title}</Dialog.Title>
           <Dialog.Description className={styles.description}>
             {mode === 'create'
-              ? '选择本机已有目录，登记项目与主管。已有资料会保留。'
-              : '填写已完成 MAT 初始化的项目根目录。接入会保留原有项目和角色身份。'}
+              ? '初始化启动时绑定的目录，登记项目与主管。已有资料会保留。'
+              : '接入启动时绑定的目录。接入会保留原有项目和角色身份。'}
           </Dialog.Description>
           <form onSubmit={submit} className={styles.form}>
             {mode === 'create' && (
@@ -91,7 +98,7 @@ function CreateDialog({ mode }: { mode: 'create' | 'attach' }) {
             )}
             <label>
               项目根目录
-              <input name="root" required placeholder="D:\项目\我的项目" autoComplete="off" />
+              <input name="root" value={root} readOnly />
             </label>
             {mode === 'create' && (
               <div className={styles.columns}>
@@ -124,70 +131,164 @@ function CreateDialog({ mode }: { mode: 'create' | 'attach' }) {
     </Dialog.Root>
   );
 }
+const navigation = [
+  ['overview', '总览', 'M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z'],
+  ['supervisor', '主管交流', 'M4 4h16v12H9l-5 4zM8 9h8m-8 3h5'],
+  ['chat', '私聊', 'M3 5h12v9H8l-5 4zM16 9h5v9h-4l-3 3v-4'],
+  [
+    'members',
+    '成员',
+    'M9 12a3 3 0 1 0 0-6 3 3 0 0 0 0 6ZM3 20v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2m2-14a3 3 0 0 1 0 6m0 2a4 4 0 0 1 4 4v2',
+  ],
+  ['tickets', '票据', 'M3 6h18v4a2 2 0 0 0 0 4v4H3v-4a2 2 0 0 0 0-4zM9 9h6m-6 6h6'],
+  ['history', '历史', 'M3 10a9 9 0 1 1 1 7m-1-7V4m0 6h6m3-3v5l3 2'],
+  ['settings', '配置', 'M4 6h16M4 12h16M4 18h16M8 4v4m8 2v4m-5 2v4'],
+] as const;
+type WorkspaceView = (typeof navigation)[number][0];
+const runtimeLabels = {
+  stopped: '已停止',
+  starting: '准备中',
+  running: '已启动',
+  stopping: '停止中',
+  unknown: '状态待核对',
+  error: '启动异常',
+  'forced-stopped': '已强制退出',
+};
+
 function ProjectDetails({ project }: { project: ProjectView }) {
-  const [view, setView] = useState<'roles' | 'chat' | 'workbench'>('roles');
+  const [params, setParams] = useSearchParams();
+  const active = navigation.find(([key]) => key === params.get('view')) ?? navigation[0];
+  const [view, title] = active;
+  const runtime = useQuery({
+    queryKey: ['project-control', project.id],
+    queryFn: async () =>
+      z
+        .object({ runtime: projectRuntimeSchema, desiredStarted: z.boolean() })
+        .parse(await request(`/api/projects/${project.id}/control`)),
+    refetchInterval: 2000,
+  });
+  const selectView = (next: WorkspaceView, values: Record<string, string> = {}) => {
+    setParams(new URLSearchParams({ ...(next === 'overview' ? {} : { view: next }), ...values }));
+  };
+  const openTicket = (id: string, section?: 'materials' | 'acceptance') =>
+    selectView('tickets', { ticket: id, ...(section ? { section } : {}) });
   return (
-    <section className={styles.details}>
-      <div className={styles.sectionHeader}>
-        <h2>{project.name}</h2>
-        <span>{project.started ? '已启动' : '未启动'}</span>
+    <div className={shell.shell}>
+      <a className={styles.skip} href="#main-content">
+        跳至项目内容
+      </a>
+      <nav className={shell.rail} aria-label="工作台导航">
+        <span className={shell.railBrand} aria-label="Mo's Agents Team">
+          MAT
+        </span>
+        {navigation.map(([key, label, path]) => (
+          <Link
+            key={key}
+            to={{ search: key === 'overview' ? '' : '?view=' + key }}
+            aria-label={label}
+            aria-current={view === key ? 'page' : undefined}
+            className={shell.railButton}
+          >
+            <svg
+              aria-hidden="true"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.6"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d={path} />
+            </svg>
+            <span aria-hidden="true" className={shell.railLabel}>
+              {label}
+            </span>
+          </Link>
+        ))}
+      </nav>
+      <div className={shell.main}>
+        <header className={shell.projectHeader}>
+          <div className={shell.projectName}>
+            <strong>{project.name}</strong>
+            <span>项目工作台</span>
+          </div>
+          <span className={shell.runtime}>
+            {runtime.isError
+              ? '运行状态待核对'
+              : runtime.data
+                ? runtimeLabels[runtime.data.runtime.state]
+                : '读取运行状态…'}
+          </span>
+        </header>
+        <main id="main-content" className={shell.canvas} tabIndex={-1}>
+          <h1 className={shell.pageTitle}>{title}</h1>
+          <Suspense fallback={<p role="status">正在载入{title}…</p>}>
+            {view === 'overview' && (
+              <>
+                <p className={shell.pageNote}>从实际期次、执行和决定记录查看项目现场。</p>
+                <Overview
+                  project={project}
+                  openTicket={openTicket}
+                  openPhase={(id) => selectView('tickets', { phase: id })}
+                  openRequests={(id) =>
+                    selectView('tickets', { panel: 'requests', ...(id ? { request: id } : {}) })
+                  }
+                  openHistory={() => selectView('history')}
+                  openSupervisor={() => selectView('supervisor')}
+                />
+              </>
+            )}
+            {(view === 'supervisor' || view === 'chat') && (
+              <ChatPanel
+                key={project.id + ':' + view + ':' + (params.get('session') ?? '')}
+                project={project}
+                mode={view === 'supervisor' ? 'supervisor' : 'private'}
+                managerSessionId={runtime.data?.runtime.managerSessionId ?? null}
+                initialSessionId={params.get('session')}
+              />
+            )}
+            {view === 'members' && (
+              <RoleAndSessionPanel
+                project={project}
+                mode="members"
+                openChat={(id) => selectView('chat', { session: id })}
+              />
+            )}
+            {(view === 'tickets' || view === 'history') && (
+              <TicketWorkbench key={project.id} project={project} />
+            )}
+            {view === 'settings' && (
+              <div className={shell.column}>
+                <section className={shell.surface} aria-label="绑定项目与运行">
+                  <h2>绑定项目与运行</h2>
+                  <dl className={styles.facts}>
+                    <dt>项目 ID</dt>
+                    <dd>{project.id}</dd>
+                    <dt>项目根</dt>
+                    <dd>{project.root}</dd>
+                    <dt>共用规范</dt>
+                    <dd>{project.paths.team}</dd>
+                  </dl>
+                  <ProjectControls projectId={project.id} />
+                  <ReviewSettings projectId={project.id} />
+                </section>
+                <section className={shell.surface} aria-label="角色与项目配置">
+                  <RoleAndSessionPanel project={project} mode="settings" />
+                </section>
+              </div>
+            )}
+          </Suspense>
+        </main>
       </div>
-      <dl className={styles.facts}>
-        <dt>项目 ID</dt>
-        <dd>{project.id}</dd>
-        <dt>项目根</dt>
-        <dd>{project.root}</dd>
-        <dt>共用规范</dt>
-        <dd>{project.paths.team}</dd>
-      </dl>
-      <ProjectControls projectId={project.id} />
-      <ReviewSettings projectId={project.id} />
-      <div className={styles.tabs} role="tablist" aria-label="项目视图">
-        <button
-          type="button"
-          role="tab"
-          aria-selected={view === 'roles'}
-          onClick={() => setView('roles')}
-        >
-          角色与会话
-        </button>
-        <button
-          type="button"
-          role="tab"
-          aria-selected={view === 'chat'}
-          onClick={() => setView('chat')}
-        >
-          私聊
-        </button>
-        <button
-          type="button"
-          role="tab"
-          aria-selected={view === 'workbench'}
-          onClick={() => setView('workbench')}
-        >
-          期次与票据
-        </button>
-      </div>
-      {view === 'roles' ? (
-        <RoleAndSessionPanel key={project.id} project={project} />
-      ) : view === 'chat' ? (
-        <Suspense fallback={<p role="status">正在载入私聊…</p>}>
-          <ChatPanel key={project.id} project={project} />
-        </Suspense>
-      ) : (
-        <Suspense fallback={<p role="status">正在载入工作台…</p>}>
-          <TicketWorkbench key={project.id} project={project} />
-        </Suspense>
-      )}
-    </section>
+    </div>
   );
 }
 function Workspace() {
   const { projectId } = useParams();
-  const projects = useProjects();
-  const selected = projects.data?.find(
-    (p): p is ProjectView => !('unavailable' in p) && p.id === projectId,
-  );
+  const workspace = useWorkspace();
+  const selected = workspace.data?.project;
+  const wrongProject = !!workspace.data && !!projectId && projectId !== selected?.id;
+  if (selected && !wrongProject) return <ProjectDetails project={selected} />;
   return (
     <>
       <a className={styles.skip} href="#main-content">
@@ -202,61 +303,30 @@ function Workspace() {
       <main id="main-content" className={styles.page}>
         <div className={styles.pageHeader}>
           <div>
-            <h1>项目</h1>
-            <p>登记项目，保留身份与资料，再开始工作。</p>
-          </div>
-          <div className={styles.actions}>
-            <CreateDialog mode="attach" />
-            <CreateDialog mode="create" />
+            <h1>项目工作台</h1>
+            <p>{workspace.data?.root}</p>
           </div>
         </div>
-        {projects.isPending && <p role="status">正在读取项目…</p>}
-        {projects.isError && (
+        {workspace.isPending && <p role="status">正在读取当前项目…</p>}
+        {workspace.isError && (
           <p role="alert" className={styles.error}>
-            {projects.error.message}
+            {workspace.error.message}
           </p>
         )}
-        {projects.data?.length === 0 && (
+        {workspace.data && !selected && !projectId && (
           <section className={styles.empty}>
-            <h2>还没有接入项目</h2>
-            <p>从新建项目开始，或接入已经初始化的项目。</p>
+            <h2>当前目录尚未初始化</h2>
+            <p>在上方绑定目录登记项目，或接入已准备的资料。</p>
+            <CreateDialog mode="create" root={workspace.data.root} />
+            <CreateDialog mode="attach" root={workspace.data.root} />
           </section>
         )}
-        {!!projects.data?.length && (
-          <div className={styles.workspace}>
-            <nav aria-label="已接入项目" className={styles.projectList}>
-              {projects.data.map((project) =>
-                'unavailable' in project ? (
-                  <div key={project.root} className={styles.unavailable}>
-                    <strong>项目暂不可用</strong>
-                    <p>{project.root}</p>
-                    <p role="alert">{project.error}</p>
-                  </div>
-                ) : (
-                  <Link
-                    key={project.id}
-                    to={`/projects/${project.id}`}
-                    className={`${styles.projectLink} ${projectId === project.id ? styles.selected : ''}`}
-                  >
-                    <strong>{project.name}</strong>
-                    <span>{project.started ? '已启动' : '未启动'}</span>
-                    <small>{project.root}</small>
-                  </Link>
-                ),
-              )}
-            </nav>
-            <div>
-              {selected ? (
-                <ProjectDetails project={selected} />
-              ) : (
-                <section className={styles.empty}>
-                  <h2>{projectId ? '未找到这个项目' : '选择一个项目'}</h2>
-                  <p>从左侧查看正式登记与角色资料。</p>
-                </section>
-              )}
-            </div>
-          </div>
-        )}
+        {wrongProject ? (
+          <section className={styles.empty}>
+            <h2>此项目未绑定当前工作台</h2>
+            <Link to="/">返回当前项目</Link>
+          </section>
+        ) : null}
       </main>
     </>
   );

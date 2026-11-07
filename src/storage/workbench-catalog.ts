@@ -1,3 +1,4 @@
+import type { WorktreeMergeRecord } from '../contracts/worktree-merges.ts';
 import { randomUUID, createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
@@ -14,6 +15,7 @@ import {
   escalationSchema,
 } from '../contracts/acceptance.ts';
 import type { MaterialDomain } from '../contracts/workbench.ts';
+import type { LocalCommitRecord } from '../contracts/local-commits.ts';
 import { SessionCatalog } from './session-catalog.ts';
 import { RoleCatalog } from './role-catalog.ts';
 import {
@@ -35,8 +37,16 @@ import {
   supervisorTaskSchema,
   operationSchema,
   conditionInputSchema,
+  planInputSchema,
+  planSchema,
+  researchQuestionInputSchema,
+  researchQuestionUpdateSchema,
+  researchAnswerInputSchema,
+  researchAnswerSchema,
 } from '../contracts/workbench.ts';
 import type {
+  ResearchQuestion,
+  ResearchAnswer,
   WorkbenchActor,
   RecordAuthor,
   PhaseRecord,
@@ -45,6 +55,7 @@ import type {
   ChecklistItem,
   HistoryEntry,
   SupervisorTask,
+  PlanRecord,
 } from '../contracts/workbench.ts';
 export function migrateWorkbench(db: DatabaseSync): void {
   db.exec(`CREATE TABLE phase(id TEXT PRIMARY KEY,code TEXT NOT NULL UNIQUE,ordinal INTEGER,parent_id TEXT UNIQUE REFERENCES phase(id),data TEXT NOT NULL);
@@ -69,6 +80,8 @@ export interface TicketExecutionScope {
   delegationId?: string;
   reviewId?: string;
   allowWrite?: boolean;
+  allowAssist?: boolean;
+  shutdownOnly?: boolean;
   cwd?: string;
 }
 const stamp = () => new Date().toISOString();
@@ -150,7 +163,8 @@ export class WorkbenchCatalog {
     if (actor.kind === 'user') return { author };
     const scope = this.scope?.(actor.sessionId);
     if (
-      !['developer', 'investigator'].includes(author.roleType ?? '') ||
+      (!['developer', 'investigator'].includes(author.roleType ?? '') &&
+        scope?.kind !== 'assistant') ||
       !scope ||
       scope.ticketId !== ticketId ||
       scope.kind === 'review' ||
@@ -428,10 +442,75 @@ export class WorkbenchCatalog {
   private saveTicket(value: TicketRecord): void {
     this.db.prepare('UPDATE ticket SET data=? WHERE id=?').run(JSON.stringify(value), value.id);
   }
+  plans(): PlanRecord[] {
+    return this.db
+      .prepare(
+        "SELECT data FROM workbench_revision WHERE kind='plan' AND seq IN (SELECT MAX(seq) FROM workbench_revision WHERE kind='plan' GROUP BY object_id) ORDER BY seq",
+      )
+      .all()
+      .map((row) => planSchema.parse(JSON.parse(String(row.data)).value));
+  }
+  getPlan(id: string): PlanRecord {
+    const row = this.db
+      .prepare(
+        "SELECT data FROM workbench_revision WHERE kind='plan' AND object_id=? ORDER BY seq DESC LIMIT 1",
+      )
+      .get(id);
+    if (!row) throw new ProjectError('PLAN_NOT_FOUND', '规划不存在');
+    return planSchema.parse(JSON.parse(String(row.data)).value);
+  }
+  savePlan(actor: WorkbenchActor, raw: unknown): PlanRecord {
+    const input = planInputSchema.parse(raw),
+      author = this.manager(actor);
+    return this.command(actor, 'save-plan', input, () => {
+      this.getPhase(input.phaseId);
+      const value: PlanRecord = {
+        ...omit(input, 'operationId'),
+        id: randomUUID(),
+        author,
+        createdAt: stamp(),
+        revision: 1,
+        confirmation: null,
+      };
+      this.revision('plan', value.id, value, author, '保存待确认规划');
+      this.history('plan-created', value.id, author, '规划不产生开工授权', [value.phaseId]);
+      return value;
+    });
+  }
+  confirmPlan(actor: WorkbenchActor, id: string, raw: unknown): PlanRecord {
+    const author = this.user(actor),
+      input = operationSchema
+        .extend({ expectedRevision: z.number().int().positive(), reason: z.string().trim().min(1) })
+        .strict()
+        .parse(raw);
+    return this.command(actor, 'confirm-plan:' + id, input, () => {
+      const value = this.getPlan(id);
+      if (value.revision !== input.expectedRevision)
+        throw new ProjectError('REVISION_CONFLICT', '规划版本已经变化');
+      if (value.confirmation)
+        throw new ProjectError('PLAN_ALREADY_CONFIRMED', '规划已经确认，请回读原记录');
+      value.confirmation = { author, at: stamp(), reason: input.reason };
+      value.revision++;
+      this.revision('plan', id, value, author, input.reason);
+      this.history('plan-confirmed', id, author, input.reason, [value.phaseId]);
+      return value;
+    });
+  }
   createTicket(actor: WorkbenchActor, raw: unknown): TicketRecord {
     const input = ticketInputSchema.parse(raw),
-      author = this.user(actor);
+      author = this.manager(actor);
     return this.command(actor, 'create-ticket', input, () => {
+      if (input.kind !== 'research' && input.researchBody.trim())
+        throw new ProjectError('RESEARCH_REQUIRED', '研究正文须明确关联研究票');
+      if (author.kind !== 'user' && !input.planId)
+        throw new ProjectError('CONFIRMED_PLAN_REQUIRED', '主管建票必须引用用户已确认的规划');
+      if (input.planId) {
+        const plan = this.getPlan(input.planId);
+        if (!plan.confirmation)
+          throw new ProjectError('CONFIRMED_PLAN_REQUIRED', '规划尚未由用户确认');
+        if (plan.phaseId !== input.phaseId)
+          throw new ProjectError('PLAN_PHASE_MISMATCH', '规划与票据期次不一致');
+      }
       const phase = this.getPhase(input.phaseId),
         category = this.category(input.categoryId);
       const id = randomUUID();
@@ -463,6 +542,9 @@ export class WorkbenchCatalog {
         code = phase.code + '-' + category.code + '-' + String(ordinal).padStart(3, '0');
       }
       const value: TicketRecord = {
+        planId: input.planId ?? null,
+        kind: input.kind,
+        research: input.kind === 'research' ? { body: input.researchBody, questions: [] } : null,
         id,
         code,
         phaseId: phase.id,
@@ -487,8 +569,20 @@ export class WorkbenchCatalog {
         )
         .run(id, code, phase.id, category.id, ordinal, value.supplementOf, JSON.stringify(value));
       this.saveDependencies(value);
-      this.revision('ticket', id, value, author, '用户确认建立正式票据');
-      this.history('ticket-created', id, author, '建立待办票据，不派工');
+      this.revision(
+        'ticket',
+        id,
+        value,
+        author,
+        input.planId ? '依据已确认规划建立正式票据' : '用户确认建立正式票据',
+      );
+      this.history(
+        'ticket-created',
+        id,
+        author,
+        '建立待办票据，不派工',
+        input.planId ? [input.planId] : [],
+      );
       return value;
     });
   }
@@ -502,7 +596,12 @@ export class WorkbenchCatalog {
       if (input.phaseId) this.getPhase(input.phaseId);
       if (input.categoryId) this.category(input.categoryId);
       const reason = input.reason,
-        patch = omit(input, 'operationId', 'expectedRevision', 'reason');
+        patch = omit(input, 'operationId', 'expectedRevision', 'reason', 'researchBody');
+      if (input.researchBody !== undefined) {
+        if (value.kind !== 'research' || !value.research)
+          throw new ProjectError('RESEARCH_REQUIRED', '只有研究票可维护研究正文');
+        value.research.body = input.researchBody;
+      }
       if (patch.dependencies) patch.dependencies = this.dependencies(value.id, patch.dependencies);
       Object.assign(value, patch, { revision: value.revision + 1 });
       this.saveTicket(value);
@@ -514,6 +613,175 @@ export class WorkbenchCatalog {
   }
   ticketHistory(id: string) {
     return this.revisions('ticket', this.getTicket(id).id);
+  }
+  private researchTicket(
+    id: string,
+  ): TicketRecord & { research: NonNullable<TicketRecord['research']> } {
+    const ticket = this.getTicket(id);
+    if (ticket.kind !== 'research' || !ticket.research)
+      throw new ProjectError('RESEARCH_REQUIRED', '此操作仅用于研究票');
+    return ticket as TicketRecord & { research: NonNullable<TicketRecord['research']> };
+  }
+  private researchQuestion(
+    ticket: ReturnType<WorkbenchCatalog['researchTicket']>,
+    id: string,
+  ): ResearchQuestion {
+    const question = ticket.research.questions.find((q) => q.id === id);
+    if (!question) throw new ProjectError('RESEARCH_QUESTION_NOT_FOUND', '原票没有此QXX问题');
+    return question;
+  }
+  addResearchQuestion(actor: WorkbenchActor, ticketId: string, raw: unknown): ResearchQuestion {
+    const input = researchQuestionInputSchema.parse(raw),
+      author = this.manager(actor);
+    return this.command(actor, 'research-question-add:' + ticketId, input, () => {
+      const ticket = this.researchTicket(ticketId),
+        n = Math.max(0, ...ticket.research.questions.map((q) => Number(q.id.slice(1)))) + 1;
+      const question: ResearchQuestion = {
+        id: 'Q' + String(n).padStart(2, '0'),
+        title: input.title,
+        question: input.question,
+        condition: input.condition,
+        sources: input.sources ?? [],
+        order: input.order ?? n,
+        revision: 1,
+        definitionRevision: 1,
+      };
+      ticket.research.questions.push(question);
+      ticket.revision++;
+      this.saveTicket(ticket);
+      this.revision('ticket', ticket.id, ticket, author, '新增研究问题');
+      this.revision(
+        'research-question',
+        ticket.id + ':' + question.id,
+        question,
+        author,
+        '创建稳定问题',
+      );
+      this.history(
+        'research-question-added',
+        ticket.id,
+        author,
+        question.id + ' ' + question.title,
+      );
+      return question;
+    });
+  }
+  updateResearchQuestion(
+    actor: WorkbenchActor,
+    ticketId: string,
+    id: string,
+    raw: unknown,
+  ): ResearchQuestion {
+    const input = researchQuestionUpdateSchema.parse(raw),
+      author = this.manager(actor);
+    return this.command(actor, 'research-question-update:' + ticketId + ':' + id, input, () => {
+      const ticket = this.researchTicket(ticketId),
+        question = this.researchQuestion(ticket, id);
+      if (question.revision !== input.expectedRevision)
+        throw new ProjectError('RESEARCH_QUESTION_REVISION', '问题修订已变化');
+      const before = JSON.stringify([
+        question.title,
+        question.question,
+        question.condition,
+        question.sources,
+      ]);
+      Object.assign(question, omit(input, 'operationId', 'expectedRevision', 'reason'));
+      if (
+        before !==
+        JSON.stringify([question.title, question.question, question.condition, question.sources])
+      )
+        question.definitionRevision++;
+      question.revision++;
+      ticket.revision++;
+      this.saveTicket(ticket);
+      this.revision('ticket', ticket.id, ticket, author, input.reason);
+      this.revision('research-question', ticket.id + ':' + id, question, author, input.reason);
+      this.history('research-question-updated', ticket.id, author, id + ' ' + input.reason);
+      return question;
+    });
+  }
+  researchAnswerHistory(ticketId: string, id: string): ResearchAnswer[] {
+    this.researchQuestion(this.researchTicket(ticketId), id);
+    return this.revisions('research-answer', ticketId + ':' + id).map((r) =>
+      researchAnswerSchema.parse(r.value),
+    );
+  }
+  researchQuestionHistory(ticketId: string, id: string) {
+    this.researchQuestion(this.researchTicket(ticketId), id);
+    return this.revisions('research-question', ticketId + ':' + id);
+  }
+  research(ticketId: string, id?: string) {
+    const ticket = this.researchTicket(ticketId),
+      questions = id
+        ? [this.researchQuestion(ticket, id)]
+        : [...ticket.research.questions].sort(
+            (a, b) => a.order - b.order || a.id.localeCompare(b.id),
+          );
+    return {
+      body: ticket.research.body,
+      entries: questions.map((question) => {
+        const answer = this.researchAnswerHistory(ticket.id, question.id).at(-1) ?? null;
+        return {
+          question,
+          answer,
+          coverage: !answer
+            ? ('unanswered' as const)
+            : answer.questionRevision === question.definitionRevision
+              ? ('current' as const)
+              : ('outdated' as const),
+        };
+      }),
+    };
+  }
+  answerResearchQuestion(
+    actor: WorkbenchActor,
+    ticketId: string,
+    id: string,
+    raw: unknown,
+  ): ResearchAnswer {
+    const input = researchAnswerInputSchema.parse(raw),
+      { author, scope } = this.writer(actor, ticketId);
+    if (
+      actor.kind !== 'session' ||
+      author.roleType !== 'investigator' ||
+      scope?.kind !== 'main' ||
+      scope.shutdownOnly
+    )
+      throw new ProjectError(
+        'RESEARCH_INVESTIGATOR_REQUIRED',
+        '正式回答由本次实际调查主执行整合保存',
+      );
+    return this.command(actor, 'research-answer:' + ticketId + ':' + id, input, () => {
+      const question = this.researchQuestion(this.researchTicket(ticketId), id),
+        previous = this.researchAnswerHistory(ticketId, id).at(-1);
+      if (question.definitionRevision !== input.expectedQuestionRevision)
+        throw new ProjectError('RESEARCH_QUESTION_REVISION', '问题定义已变化，不能沿用旧条件答复');
+      if ((previous?.revision ?? 0) !== input.expectedAnswerRevision)
+        throw new ProjectError('RESEARCH_ANSWER_REVISION', '回答修订已变化，请回读最新记录');
+      const answer: ResearchAnswer = {
+        id: randomUUID(),
+        questionId: id,
+        questionRevision: question.definitionRevision,
+        revision: (previous?.revision ?? 0) + 1,
+        status: input.status,
+        content: input.content,
+        evidence: input.evidence,
+        unconfirmed: input.unconfirmed,
+        executionId: scope.executionId,
+        author,
+        createdAt: stamp(),
+        previousAnswerId: previous?.id ?? null,
+      };
+      this.revision(
+        'research-answer',
+        ticketId + ':' + id,
+        answer,
+        author,
+        '调查执行记录回答与证据，不表示采纳',
+      );
+      this.history('research-answer-saved', ticketId, author, id + ' 回答修订 ' + answer.revision);
+      return answer;
+    });
   }
   checklistHistory(id: string) {
     return this.revisions('checklist', this.getTicket(id).id);
@@ -544,6 +812,10 @@ export class WorkbenchCatalog {
       author,
       createdAt: stamp(),
       executionId: scope?.executionId ?? null,
+      collaborationId:
+        'delegationId' in (scope ?? {})
+          ? ((scope as TicketExecutionScope).delegationId ?? null)
+          : null,
     };
     this.db
       .prepare('INSERT INTO work_log(ticket_id,id,ordinal,data) VALUES(?,?,?,?)')
@@ -580,7 +852,11 @@ export class WorkbenchCatalog {
       const ticket = this.getTicket(ticketId),
         { author, scope } = this.writer(actor, ticket.id),
         value = this.getLog(ticket.id, id);
-      if (scope?.kind === 'assistant' && value.author.sessionId !== author.sessionId)
+      if (
+        scope?.kind === 'assistant' &&
+        (value.author.sessionId !== author.sessionId ||
+          value.collaborationId !== scope.delegationId)
+      )
         throw new ProjectError(
           'LOG_OWNER_REQUIRED',
           '辅助只能整理自己的Log；纠正他人正文请追加记录',
@@ -603,11 +879,87 @@ export class WorkbenchCatalog {
     this.getLog(ticketId, id);
     return this.revisions('log', this.getTicket(ticketId).id + ':' + id);
   }
+  private assistantLogs(parentSessionId: string, executionId?: string) {
+    this.sessions.get(parentSessionId);
+    return this.db
+      .prepare(
+        `SELECT l.data,c.execution_id AS execution_id FROM work_log l
+      JOIN collaboration c ON c.id=json_extract(l.data,'$.collaborationId')
+      WHERE json_extract(c.data,'$.parentSessionId')=? ORDER BY l.rowid`,
+      )
+      .all(parentSessionId)
+      .filter((row) => !executionId || row.execution_id === executionId)
+      .map((row) => {
+        const log = logSchema.parse(JSON.parse(String(row.data)));
+        return {
+          ticketId: log.ticketId,
+          ticketCode: this.getTicket(log.ticketId).code,
+          collaborationId: log.collaborationId!,
+          executionId: String(row.execution_id),
+          logId: log.id,
+          title: log.title,
+          author: log.author,
+          createdAt: log.createdAt,
+        };
+      });
+  }
+  pendingAssistantLogs(parentSessionId: string, executionId?: string) {
+    return this.assistantLogs(parentSessionId, executionId).filter(
+      (n) =>
+        !this.db
+          .prepare(
+            "SELECT 1 FROM workbench_revision WHERE kind='assistant-log-receipt' AND object_id=? LIMIT 1",
+          )
+          .get(parentSessionId + ':' + n.ticketId + ':' + n.logId),
+    );
+  }
+  acceptAssistantLogNotices(
+    parentSessionId: string,
+    notices: { ticketId: string; logId: string }[],
+    requestId: string,
+  ): void {
+    transaction(this.db, () => {
+      const row = this.db
+        .prepare('SELECT data FROM model_request WHERE id=? AND session_id=?')
+        .get(requestId, parentSessionId);
+      if (!row)
+        throw new ProjectError('LOG_NOTICE_REQUEST_REQUIRED', '提醒接纳缺少原主会话实际请求');
+      const request = JSON.parse(String(row.data)),
+        sources = this.assistantLogs(parentSessionId, request.executionId);
+      for (const notice of notices) {
+        const source = sources.find(
+          (n) => n.ticketId === notice.ticketId && n.logId === notice.logId,
+        );
+        if (!source || !request.executionId || source.createdAt > request.startedAt)
+          throw new ProjectError('LOG_NOTICE_SOURCE', '提醒不是本次实际请求可接纳的辅助Log');
+      }
+      for (const notice of notices) {
+        const key = parentSessionId + ':' + notice.ticketId + ':' + notice.logId;
+        if (
+          this.db
+            .prepare(
+              "SELECT 1 FROM workbench_revision WHERE kind='assistant-log-receipt' AND object_id=? LIMIT 1",
+            )
+            .get(key)
+        )
+          continue;
+        this.revision(
+          'assistant-log-receipt',
+          key,
+          { ...notice, parentSessionId, requestId },
+          this.author({ kind: 'session', sessionId: parentSessionId }),
+          '合并提示已进入实际模型请求，不代表已阅读正文',
+        );
+      }
+    });
+  }
   updateChecklist(actor: WorkbenchActor, ticketId: string, raw: unknown): TicketRecord {
     const input = checklistUpdateSchema.parse(raw);
     return this.command(actor, 'update-checklist:' + ticketId, input, () => {
       const ticket = this.getTicket(ticketId),
         { author, scope } = this.writer(actor, ticket.id);
+      if (scope?.shutdownOnly)
+        throw new ProjectError('ASSISTANT_STOPPING', '辅助仅可收尾，不展开Checklist工作');
       if ((input.logId === undefined) === (input.newLog === undefined))
         throw new ProjectError('LOG_REQUIRED', 'Checklist更新须且只能提供同票已有Log或同次新Log');
       const log = input.newLog
@@ -1098,6 +1450,146 @@ export class WorkbenchCatalog {
       input.resultId,
     ]);
   }
+  localCommitArranged(actor: WorkbenchActor, value: LocalCommitRecord): void {
+    const author = this.manager(actor);
+    if (author.roleType !== 'supervisor' || author.sessionId !== value.managerSessionId)
+      throw new ProjectError('LOCAL_COMMIT_MANAGER', '本地事项须来自原真实主管');
+    const task = supervisorTaskSchema.parse({
+      id: value.taskId,
+      level: 'short',
+      title:
+        (value.kind === 'baseline' ? '初始基线' : '必要本地提交') + ' · ' + value.plan.repository,
+      parentId: null,
+      state: 'unchecked',
+      basis: value.basis + '；原本地事项 ' + value.id,
+      ticketIds: value.ticketIds,
+      business: { kind: 'local-commit', id: value.id },
+      author,
+      createdAt: stamp(),
+      revision: 1,
+    });
+    this.db
+      .prepare('INSERT INTO supervisor_task(id,data) VALUES(?,?)')
+      .run(task.id, JSON.stringify(task));
+    this.revision('supervisor-task', task.id, task, author, '主管明确本地提交安排');
+    this.history('local-commit-arranged', value.id, author, value.basis, [
+      ...value.ticketIds,
+      ...value.versionIds,
+      value.taskId,
+    ]);
+  }
+  mergeArranged(actor: WorkbenchActor, value: WorktreeMergeRecord): void {
+    const author = this.author(actor);
+    if (
+      actor.kind !== 'session' ||
+      author.roleType !== 'supervisor' ||
+      actor.sessionId !== value.managerSessionId
+    )
+      throw new ProjectError('MERGE_SOURCE', '合入事项须来自原实际主管');
+    const task = supervisorTaskSchema.parse({
+      id: value.taskId,
+      level: 'short',
+      title: '跨树合入 · ' + value.preview.plan.target.repository,
+      parentId: null,
+      state: 'unchecked',
+      basis: value.basis + '；原合入 ' + value.id,
+      ticketIds: [value.preview.source.ticketId, value.combinationTicketId],
+      business: { kind: 'worktree-merge', id: value.id },
+      author,
+      createdAt: stamp(),
+      revision: 1,
+    });
+    this.db
+      .prepare('INSERT INTO supervisor_task(id,data) VALUES(?,?)')
+      .run(task.id, JSON.stringify(task));
+    this.revision('supervisor-task', task.id, task, author, '主管明确跨树合入安排');
+    this.history('worktree-merge-arranged', value.id, author, value.basis, [
+      ...task.ticketIds,
+      value.preview.source.versionId,
+      value.taskId,
+    ]);
+  }
+  mergeChanged(actor: WorkbenchActor, value: WorktreeMergeRecord, kind: string): void {
+    const author = this.author(actor);
+    if (
+      actor.kind !== 'session' ||
+      ![value.managerSessionId, value.committerSessionId].includes(actor.sessionId)
+    )
+      throw new ProjectError('MERGE_SOURCE', '合入进展须来自原实际安排');
+    const task = this.getTask(value.taskId);
+    if (task.business?.kind !== 'worktree-merge' || task.business.id !== value.id)
+      throw new ProjectError('MERGE_TASK', '原合入与主管清单关联不同');
+    task.state =
+      value.status === 'completed' && value.lastProof?.state === 'verified' && value.combination
+        ? 'checked'
+        : ['unknown', 'conflict', 'repairing', 'awaiting-verification', 'blocked'].includes(
+              value.status,
+            )
+          ? 'held'
+          : 'unchecked';
+    if (value.repair && !task.ticketIds.includes(value.repair.ticketId))
+      task.ticketIds.push(value.repair.ticketId);
+    task.basis =
+      value.basis +
+      '；原合入 ' +
+      value.id +
+      '；状态 ' +
+      value.status +
+      '。Git事实与组合核验分别保存。';
+    task.revision++;
+    this.db
+      .prepare('UPDATE supervisor_task SET data=? WHERE id=?')
+      .run(JSON.stringify(task), task.id);
+    this.revision('supervisor-task', task.id, task, author, '原合入实际进展');
+    this.history(
+      'worktree-merge-' + kind,
+      value.id,
+      author,
+      value.lastProof?.reason ?? value.lastInspection?.note ?? '原合入进展',
+      [...task.ticketIds, value.preview.source.versionId, value.taskId],
+    );
+  }
+  localCommitChanged(actor: WorkbenchActor, value: LocalCommitRecord, kind: string): void {
+    const author = this.author(actor);
+    if (
+      actor.kind !== 'session' ||
+      ![value.managerSessionId, value.committerSessionId].includes(actor.sessionId)
+    )
+      throw new ProjectError('LOCAL_COMMIT_SOURCE', '本地事项记录须来自原主管或原提交者');
+    const task = this.getTask(value.taskId);
+    if (task.business?.kind !== 'local-commit' || task.business.id !== value.id)
+      throw new ProjectError('LOCAL_COMMIT_TASK', '原事项与待处理关联不符');
+    task.state =
+      value.status === 'completed' && value.lastProof?.state === 'verified'
+        ? 'checked'
+        : ['blocked', 'unknown'].includes(value.status)
+          ? 'held'
+          : 'unchecked';
+    task.basis =
+      value.basis +
+      '；本地事项 ' +
+      value.id +
+      '；状态 ' +
+      value.status +
+      '。Git事实、原命令与业务验收分别核对。';
+    task.revision++;
+    this.db
+      .prepare('UPDATE supervisor_task SET data=? WHERE id=?')
+      .run(JSON.stringify(task), task.id);
+    this.revision('supervisor-task', task.id, task, author, '本地事项实际进展');
+    this.history(
+      value.status === 'completed' ? 'local-commit-verified' : 'local-commit-' + kind,
+      value.id,
+      author,
+      value.lastProof?.reason ?? value.lastInspection?.note ?? '原事项进展',
+      [
+        ...value.ticketIds,
+        ...value.versionIds,
+        value.taskId,
+        ...(value.lastProof?.commit ? [value.lastProof.commit] : []),
+      ],
+    );
+  }
   createTask(actor: WorkbenchActor, raw: unknown): SupervisorTask {
     const input = operationSchema
         .extend({
@@ -1155,9 +1647,58 @@ export class WorkbenchCatalog {
         throw new ProjectError('REVISION_CONFLICT', '主管清单版本已经变化');
       if (task.level === 'long' && input.title !== undefined) this.user(actor);
       const ids = input.ticketIds ?? task.ticketIds;
+      if (task.business?.kind === 'worktree-merge') {
+        if (
+          input.ticketIds &&
+          JSON.stringify([...input.ticketIds].sort()) !== JSON.stringify([...task.ticketIds].sort())
+        )
+          throw new ProjectError('MERGE_TASK', '业务关联回到原合入维护，不能改挂清单');
+        if ((input.state ?? task.state) === 'checked') {
+          const row = this.db
+              .prepare('SELECT data FROM worktree_merge WHERE id=?')
+              .get(task.business.id),
+            record = row ? JSON.parse(String(row.data)) : null;
+          if (
+            record?.taskId !== task.id ||
+            record.status !== 'completed' ||
+            record.lastProof?.state !== 'verified' ||
+            !record.combination
+          )
+            throw new ProjectError(
+              'MERGE_RESULT_REQUIRED',
+              '合入与组合结果尚未核定，不能以清单勾选替代',
+            );
+        }
+      }
+      if (task.business?.kind === 'local-commit') {
+        if (
+          input.ticketIds &&
+          JSON.stringify([...input.ticketIds].sort()) !== JSON.stringify([...task.ticketIds].sort())
+        )
+          throw new ProjectError('LOCAL_COMMIT_TASK', '业务关联回到原事项维护，不能改挂清单');
+        if ((input.state ?? task.state) === 'checked') {
+          const row = this.db
+              .prepare('SELECT data FROM local_commit_arrangement WHERE id=?')
+              .get(task.business.id),
+            record = row ? JSON.parse(String(row.data)) : null;
+          if (
+            record?.taskId !== task.id ||
+            record.status !== 'completed' ||
+            record.lastProof?.state !== 'verified'
+          )
+            throw new ProjectError(
+              'LOCAL_COMMIT_RESULT_REQUIRED',
+              '本地Git结果未核定，清单勾选不能替代',
+            );
+        }
+      }
       for (const ticketId of ids) {
         const ticket = this.getTicket(ticketId);
-        if ((input.state ?? task.state) === 'checked' && ticket.state !== 'completed')
+        if (
+          !task.business &&
+          (input.state ?? task.state) === 'checked' &&
+          ticket.state !== 'completed'
+        )
           throw new ProjectError(
             'TASK_RESULT_INCOMPLETE',
             '关联票据尚未完成，不能以清单勾选绕过必要审阅或验收',

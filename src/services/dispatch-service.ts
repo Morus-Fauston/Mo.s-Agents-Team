@@ -9,8 +9,16 @@ import type { NativeAgent, NativeEvent, NativeMessage } from '../host/native.ts'
 import type { ProjectService } from './project-service.ts';
 import { ProjectError } from './errors.ts';
 import { messageIdentity } from './message-presentation.ts';
-import { canonicalDirectory, scopesOverlap } from './write-scopes.ts';
+import { canonicalDirectory } from './write-scopes.ts';
 export interface DispatchHost {
+  observeSessionReuse?(
+    project: string,
+    session: SessionRecord,
+    previous: ExecutionRecord,
+  ): NonNullable<ExecutionRecord['sessionReuse']>['observation'] | undefined;
+  workspaceDirectory?(project: string, actor: WorkbenchActor, id: string, cwd?: string): string;
+  admitWorkspace?(project: string, executionId: string, cwd: string): Promise<unknown>;
+  confirmWorkspaceBaseline?(project: string, executionId: string, versionId: string): void;
   create(
     projectId: string,
     input: SessionInput,
@@ -53,27 +61,34 @@ export class DispatchService {
   private globalGuard(projectId: string, scopes: string[]): void {
     for (const entry of this.projects.list()) {
       if ('unavailable' in entry || entry.id === projectId) continue;
-      for (const value of this.projects.forProject(entry.id).executions().list())
-        if (
-          value.writeOccupancy !== 'released' &&
-          value.writeScopes.some((old) => scopes.some((scope) => scopesOverlap(old, scope)))
-        )
-          throw new ProjectError(
-            'WRITE_SCOPE_BUSY',
-            '写入范围与本插件另一项目的已登记执行冲突；未知占用不释放',
-          );
+      this.projects.forProject(entry.id).executions().guardExistingScope('', scopes);
     }
   }
   dispatch(projectId: string, actor: WorkbenchActor, raw: unknown): ExecutionRecord {
     if (this.closed) throw new ProjectError('DISPATCH_CLOSED', '派工服务正在关闭');
     this.projects.forProject(projectId).controls().requireDispatch();
-    const input = dispatchInputSchema.parse(raw);
+    const parsed = dispatchInputSchema.parse(raw);
+    const input = parsed.worktreeId
+      ? { ...parsed, cwd: this.workspaceDirectory(projectId, actor, parsed.worktreeId, parsed.cwd) }
+      : parsed;
     const catalog = this.catalog(projectId),
-      result = catalog.register(actor, input, this.epoch, (scopes) =>
-        this.globalGuard(projectId, scopes),
+      result = catalog.register(
+        actor,
+        input,
+        this.epoch,
+        (scopes) => this.globalGuard(projectId, scopes),
+        (session, previous) => this.host.observeSessionReuse?.(projectId, session, previous),
       );
     if (result.isNew) this.queueStart(projectId, result.record.id);
     return result.record;
+  }
+  private workspaceDirectory(project: string, actor: WorkbenchActor, id: string, cwd?: string) {
+    if (!this.host.workspaceDirectory)
+      throw new ProjectError(
+        'WORKTREE_UNAVAILABLE',
+        '当前执行宿主没有工作树关联接口，不按普通cwd降级',
+      );
+    return this.host.workspaceDirectory(project, actor, id, cwd);
   }
   supplement(projectId: string, actor: WorkbenchActor, raw: unknown) {
     if (this.closed) throw new ProjectError('DISPATCH_CLOSED', '派工服务正在关闭');
@@ -81,7 +96,14 @@ export class DispatchService {
     connection.controls().requireDispatch();
     let isNew = false;
     const result = connection.acceptance().supplement(actor, raw, (input) => {
-      const registered = this.catalog(projectId).register(actor, input, this.epoch, (scopes) =>
+      const parsed = dispatchInputSchema.parse(input);
+      const actual = parsed.worktreeId
+        ? {
+            ...parsed,
+            cwd: this.workspaceDirectory(projectId, actor, parsed.worktreeId, parsed.cwd),
+          }
+        : parsed;
+      const registered = this.catalog(projectId).register(actor, actual, this.epoch, (scopes) =>
         this.globalGuard(projectId, scopes),
       );
       isNew = registered.isNew;
@@ -140,7 +162,28 @@ export class DispatchService {
       if (this.closed)
         throw new ProjectError('DISPATCH_CLOSED', '会话已准备但宿主正在关闭，未继续启动');
       const agent = await this.host.open(projectId, session.id);
-      if (agent.status !== 'idle' || agent.inbox.nextStep.length > 0)
+      const requireReuseQuiet = () => {
+        if (!value.sessionReuse) return;
+        const current = connection.session(session.id);
+        const proof = this.host.observeSessionReuse?.(
+          projectId,
+          current,
+          catalog.get(value.sessionReuse.previousExecutionId),
+        );
+        if (
+          current.communicationState !== 'active' ||
+          current.error ||
+          proof?.state !== 'confirmed' ||
+          proof.nativeSessionId !== value.nativeSessionId ||
+          proof.epoch !== this.epoch
+        )
+          throw new ProjectError(
+            'SESSION_REUSE_NOT_QUIET',
+            '新票准备期间原会话状态改变，未创建新Goal。' + (proof?.note ?? ''),
+          );
+      };
+      requireReuseQuiet();
+      if (!value.sessionReuse && (agent.status !== 'idle' || agent.inbox.nextStep.length > 0))
         throw new ProjectError(
           'SESSION_PREVIOUS_INPUT',
           '原会话有在途或未核对输入，不悄悄接管旧工作',
@@ -155,11 +198,14 @@ export class DispatchService {
       catalog.resolveWorkingDirectory(id, actualCwd, (scopes) =>
         this.globalGuard(projectId, scopes),
       );
+      await this.host.admitWorkspace?.(projectId, id, actualCwd);
+      requireStart();
       value = catalog.get(id);
       if (value.requestedConfiguration) agent.model.select(value.requestedConfiguration);
       const configuration = executionConfigurationSchema.parse(agent.model.current());
       const domain = connection.workbench().allocateCurrentMaterial(session.id);
       const baseline = connection.versions().baseline(id);
+      this.host.confirmWorkspaceBaseline?.(projectId, id, baseline.id);
       const ticket = connection.workbench().getTicket(value.ticketId);
       const objective = [
         'MAT本次正式执行。目标与权限仅限以下持久记录，不能从旧会话或Goal扩围。',
@@ -168,6 +214,17 @@ export class DispatchService {
           dispatchId: value.dispatchId,
           ticket: value.ticketCode,
           ticketRevision: value.ticketRevision,
+          kind: ticket.kind,
+          ...(ticket.kind === 'research'
+            ? {
+                research: {
+                  questionIds: ticket.research?.questions.map((q) => q.id) ?? [],
+                  readTool: 'mat_ticket section=research，questionId逐题读取定义和回答',
+                  completion:
+                    '调查主执行完成Chat明确reportPaths，报告须在本次材料域；不能把回答当采纳',
+                },
+              }
+            : {}),
           goal: ticket.goal,
           included: ticket.included,
           excluded: ticket.excluded,
@@ -204,6 +261,7 @@ export class DispatchService {
           '本次完整目标超出启动预算，拒绝截断后开工',
         );
       const boundary = Math.max(0, ...agent.session.snapshotEvents().map((event) => event.seq));
+      requireReuseQuiet();
       catalog.starting(id, boundary, configuration, objective);
       const latestGoal = this.host.getGoal(agent);
       if (latestGoal && latestGoal.phase !== 'complete')
@@ -234,13 +292,14 @@ export class DispatchService {
       const unknown =
         mayHaveStarted ||
         this.closed ||
-        (error instanceof ProjectError && error.code === 'SESSION_PREVIOUS_INPUT');
+        (error instanceof ProjectError &&
+          ['SESSION_PREVIOUS_INPUT', 'SESSION_REUSE_NOT_QUIET'].includes(error.code));
       catalog.fail(id, {
         code: error instanceof ProjectError ? error.code : 'HOST_START_FAILED',
         message:
           error instanceof ProjectError
             ? error.message
-            : '宿主启动接缝未完成，原始记录见关联DSH会话；未自动换模或重派',
+            : '宿主启动接缝未完成，原始记录见关联DSH会话；模型选择和实际请求另查配置记录，未盲目重派',
         unknown,
       });
       if (!this.closed) await this.publishProblems(projectId, value.id);
@@ -284,7 +343,13 @@ export class DispatchService {
       }
     }
   }
-  observe(projectId: string, sessionId: string, agent: NativeAgent, event: NativeEvent): void {
+  observe(
+    projectId: string,
+    sessionId: string,
+    agent: NativeAgent,
+    event: NativeEvent,
+    modelChangeId?: string,
+  ): void {
     const catalog = this.catalog(projectId),
       value = catalog.currentForSession(sessionId);
     if (
@@ -301,7 +366,7 @@ export class DispatchService {
       } else if (event.type === 'step/end') {
         catalog.stepEnded(sessionId, event);
       } else if (event.type === 'turn/end') {
-        catalog.turnEnded(sessionId, event);
+        catalog.turnEnded(sessionId, event, modelChangeId);
         if ((event.data.reason as { kind?: string } | undefined)?.kind === 'completed')
           catalog.settleEndedSteps(value.id, Number(event.data.turn));
         if (catalog.get(value.id).failure)
@@ -432,6 +497,15 @@ export class DispatchService {
         ticketId: ticket.id,
         ticketCode: ticket.code,
         requirementsRevision: ticket.revision,
+        kind: ticket.kind,
+        ...(ticket.kind === 'research'
+          ? {
+              research: {
+                questionIds: ticket.research?.questions.map((q) => q.id) ?? [],
+                readTool: 'mat_ticket section=research，questionId逐题读取；定义/回答修订分开',
+              },
+            }
+          : {}),
         goal: ticket.goal,
         included: ticket.included,
         excluded: ticket.excluded,
@@ -445,7 +519,15 @@ export class DispatchService {
         dependencies: ticket.dependencies,
         reviewedDependencies: value.dependencyEvidence,
         cwd: value.cwd,
+        worktreeId: value.worktreeId,
         writeScopes: value.writeScopes,
+        delegatedWriteScopes: connection
+          .collaborations()
+          .unsettled(value.id)
+          .filter((row) => row.writeScopes.length)
+          .map((row) => ({ collaborationId: row.id, paths: row.writeScopes })),
+        scopeCoordination:
+          '辅助受理范围由该辅助负责；主会话与其他辅助不并行写其重叠路径。等待正式交回或明确停稳调整，不把等待当释放。',
         materialReadRoot: ticket.materialRoot,
         materialWriteDomain: domain.path,
         managerSessionIds: value.managerSessionIds,
@@ -502,7 +584,9 @@ export class DispatchService {
       catalog = this.catalog(projectId);
     if (!id) return catalog.list();
     const record = catalog.get(id),
-      agent = record.sessionId ? this.host.peek(projectId, record.sessionId) : undefined;
+      historical = ['closed', 'terminated'].includes(record.lifecycleState),
+      agent =
+        record.sessionId && !historical ? this.host.peek(projectId, record.sessionId) : undefined;
     let goal: NativeGoalView | null = null,
       goalError: string | null = null;
     if (agent)
@@ -519,6 +603,7 @@ export class DispatchService {
       events: catalog.events(record.id),
       session: record.sessionId ? connection.session(record.sessionId) : null,
       native: {
+        historical,
         loaded: !!agent,
         status: agent?.status ?? null,
         cwd: agent ? this.host.directory(agent) : null,
@@ -536,7 +621,7 @@ export class DispatchService {
         .filter((domain) => domain.referenceId === record.id),
       control: {
         revision: connection.controls().revision(record.id),
-        controls: connection.controls().list(record.id),
+        controls: connection.controls().publicList(record.id),
         jobs: connection.controls().jobs(record.id),
       },
       unavailableActions: [],

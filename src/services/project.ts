@@ -1,3 +1,6 @@
+import { WorktreeMergeCatalog, migrateWorktreeMerges } from '../storage/worktree-merge-catalog.ts';
+import { requireReviewedDelivery } from './delivery-approval.ts';
+import { WorktreeCatalog, migrateWorktrees } from '../storage/worktree-catalog.ts';
 import { DatabaseSync } from 'node:sqlite';
 import { randomInt } from 'node:crypto';
 import {
@@ -16,6 +19,12 @@ import { ProjectError } from './errors.ts';
 import { transaction } from '../storage/transaction.ts';
 import { RoleCatalog, migrateRoles } from '../storage/role-catalog.ts';
 import { SessionCatalog, migrateSessions } from '../storage/session-catalog.ts';
+import { ModelPolicyCatalog, migrateModelPolicies } from '../storage/model-policy-catalog.ts';
+import { LocalCommitCatalog, migrateLocalCommits } from '../storage/local-commit-catalog.ts';
+import {
+  DecisionRequestCatalog,
+  migrateDecisionRequests,
+} from '../storage/decision-request-catalog.ts';
 import type { RoleInput, RegisteredRole, RoleUpdate } from '../contracts/roles.ts';
 import type { SessionInput, SessionRecord } from '../contracts/sessions.ts';
 import type { RequestRecord } from '../contracts/session-runtime.ts';
@@ -27,7 +36,20 @@ import { ControlCatalog, migrateControls } from '../storage/control-catalog.ts';
 import { VersionCatalog, migrateVersions } from '../storage/version-catalog.ts';
 import { ReviewCatalog, migrateCompletions } from '../storage/review-catalog.ts';
 import { ReviewResultCatalog, migrateReviewResults } from '../storage/review-results-catalog.ts';
-import { AcceptanceCatalog, ensureAcceptanceSchema } from '../storage/acceptance-catalog.ts';
+import {
+  AcceptanceCatalog,
+  ensureAcceptanceSchema,
+  ticketRequirementsHash,
+} from '../storage/acceptance-catalog.ts';
+import { CollaborationCatalog, migrateCollaboration } from '../storage/collaboration-catalog.ts';
+import {
+  AssistantControlCatalog,
+  migrateAssistantControls,
+} from '../storage/assistant-control-catalog.ts';
+import {
+  CollaborationResultsCatalog,
+  migrateCollaborationResults,
+} from '../storage/collaboration-results-catalog.ts';
 export { ProjectError } from './errors.ts';
 export type {
   ExecutionConfiguration,
@@ -133,7 +155,7 @@ function view(db: DatabaseSync, root: string): ProjectView {
 }
 function migrate(db: DatabaseSync): void {
   const version = Number(db.prepare('PRAGMA user_version').get()?.user_version);
-  if (version > 10) throw new ProjectError('FUTURE_SCHEMA', '数据库版本高于当前软件，拒绝降级写入');
+  if (version > 19) throw new ProjectError('FUTURE_SCHEMA', '数据库版本高于当前软件，拒绝降级写入');
   if (version === 0) {
     db.exec(`CREATE TABLE project(singleton INTEGER PRIMARY KEY CHECK(singleton=1),id TEXT NOT NULL UNIQUE,name TEXT NOT NULL,attached INTEGER NOT NULL DEFAULT 0 CHECK(attached IN(0,1)),started INTEGER NOT NULL DEFAULT 0 CHECK(started IN(0,1)));
       CREATE TABLE role(id TEXT PRIMARY KEY,code TEXT NOT NULL UNIQUE,type TEXT NOT NULL,configuration TEXT NOT NULL);
@@ -150,6 +172,16 @@ function migrate(db: DatabaseSync): void {
   if (version < 9) migrateCompletions(db);
   if (version < 10) migrateReviewResults(db);
   ensureAcceptanceSchema(db);
+  if (version < 11) migrateCollaboration(db);
+  if (version < 12) migrateCollaborationResults(db);
+  if (version < 13) migrateAssistantControls(db);
+  if (version < 14) migrateDecisionRequests(db);
+  if (version < 15) migrateModelPolicies(db);
+  if (version < 16) migrateLocalCommits(db);
+  if (version < 17) migrateWorktrees(db);
+  if (version < 18) migrateWorktreeMerges(db);
+  if (version < 19)
+    db.exec('ALTER TABLE session ADD COLUMN communication_origin TEXT; PRAGMA user_version=19;');
 }
 export function initializeProject(input: InitializeInput): ProjectView {
   if (!input || typeof input.name !== 'string' || !input.name.trim() || input.name.length > 160)
@@ -271,6 +303,14 @@ export function readProject(inputRoot: string): ProjectView {
   }
 }
 export interface ProjectConnection {
+  worktrees(): WorktreeCatalog;
+  localCommits(): LocalCommitCatalog;
+  worktreeMerges(): WorktreeMergeCatalog;
+  modelPolicies(): ModelPolicyCatalog;
+  decisionRequests(): DecisionRequestCatalog;
+  collaborationResults(): CollaborationResultsCatalog;
+  assistantControls(): AssistantControlCatalog;
+  collaborations(): CollaborationCatalog;
   controls(): ControlCatalog;
   versions(): VersionCatalog;
   reviews(): ReviewCatalog;
@@ -310,7 +350,7 @@ export function connectProject(inputRoot: string): ProjectConnection {
   try {
     db.exec('PRAGMA foreign_keys=ON');
     const version = Number(db.prepare('PRAGMA user_version').get()?.user_version);
-    if (version < 1 || version > 10)
+    if (version < 1 || version > 19)
       throw new ProjectError('SCHEMA_MISMATCH', '项目数据库版本不匹配，请先核对升级与初始化结果');
     db.exec('PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE');
     try {
@@ -328,8 +368,104 @@ export function connectProject(inputRoot: string): ProjectConnection {
     const messages = new MessageCatalog(db, sessions, roles, view(db, root).id);
     const workbench = new WorkbenchCatalog(db, root, sessions, roles);
     const executions = new ExecutionCatalog(db, sessions, roles, workbench);
-    const controls = new ControlCatalog(db, workbench, executions, sessions);
+    const collaborations = new CollaborationCatalog(db, sessions, roles, executions, workbench);
+    const collaborationResults = new CollaborationResultsCatalog(
+      db,
+      collaborations,
+      executions,
+      sessions,
+      workbench,
+    );
+    const assistantControls = new AssistantControlCatalog(
+      db,
+      collaborations,
+      executions,
+      sessions,
+      workbench,
+    );
+    collaborations.bindControlAccess((id) => assistantControls.access(id));
+    const controls = new ControlCatalog(db, workbench, executions, sessions, assistantControls);
+    const decisions = new DecisionRequestCatalog(
+      db,
+      workbench,
+      executions,
+      sessions,
+      collaborations,
+    );
+    assistantControls.bindChange((id) => {
+      const latest = controls.activeControl(id);
+      if (latest?.observation && latest.assistantTargetIds.length)
+        controls.observeStopped(latest.id, latest.observation);
+    });
     const versions = new VersionCatalog(db, executions, workbench, sessions, root);
+    const worktrees = new WorktreeCatalog(db, sessions, workbench, executions, root, controls);
+    const localCommits = new LocalCommitCatalog(
+      db,
+      sessions,
+      workbench,
+      executions,
+      versions,
+      root,
+    );
+    const worktreeMerges = new WorktreeMergeCatalog(
+      db,
+      sessions,
+      workbench,
+      executions,
+      controls,
+      root,
+    );
+    worktrees.bindGitGuard((common) => {
+      if (worktreeMerges.busyRepository(common))
+        throw new ProjectError('WORKTREE_MERGE_BUSY', '原共同仓库有合入事项，先核定');
+      if (localCommits.busyRepository(common))
+        throw new ProjectError('WORKTREE_GIT_BUSY', '原共同仓库有本地提交事项，先核定原结果');
+    });
+    worktreeMerges.bindGitGuard((common) => {
+      if (worktrees.busyRepository(common) || localCommits.busyRepository(common))
+        throw new ProjectError('MERGE_GIT_BUSY', '原共同仓库有工作树或本地提交事项，先核定');
+    });
+    localCommits.bindMergeGuard((actor, input, plan) =>
+      worktreeMerges.authorizeCorrectionCommit(actor, input, plan),
+    );
+    localCommits.bindGitGuard((common, mergeId) => {
+      if (worktreeMerges.busyRepository(common, mergeId))
+        throw new ProjectError('LOCAL_COMMIT_MERGE_BUSY', '原共同仓库有合入事项，先核定');
+      if (worktrees.busyRepository(common))
+        throw new ProjectError(
+          'LOCAL_COMMIT_WORKTREE_BUSY',
+          '原共同仓库有工作树创建或未知结果，先核定原创建',
+        );
+    });
+    worktreeMerges.bindWorkerGuard((session) => {
+      if (localCommits.currentForSession(session))
+        throw new ProjectError('MERGE_LOCAL_WORKER_BUSY', '原提交者仍有本地事项，不另接新的合入');
+    });
+    localCommits.bindWorkerGuard((session, mergeId) => {
+      const merge = worktreeMerges.currentForSession(session);
+      if (merge && merge.id !== mergeId)
+        throw new ProjectError(
+          'LOCAL_COMMIT_MERGE_WORKER_BUSY',
+          '原提交者仍有未办合入，不另接其他Git事项',
+        );
+    });
+    executions.bindLocalCommitGuard((scopes, mergeId) => {
+      localCommits.guardScopes(scopes);
+      worktreeMerges.guardScopes(scopes, mergeId);
+    });
+    executions.bindMergeContext(
+      (actor, input) => worktreeMerges.validateDispatch(actor, input),
+      (execution) => worktreeMerges.linkExecution(execution),
+    );
+    versions.bindMergeContext((execution) => worktreeMerges.snapshotContext(execution));
+    messages.bindMergeNotices(
+      (id) => worktreeMerges.isCurrentNotice(id),
+      (id, notice) => worktreeMerges.noticeInput(id, notice),
+    );
+    messages.bindLocalCommitNotices(
+      (id) => localCommits.isCurrentNotice(id),
+      (id, notice) => localCommits.noticeInput(id, notice),
+    );
     const reviews = new ReviewCatalog(
       db,
       executions,
@@ -347,6 +483,15 @@ export function connectProject(inputRoot: string): ProjectConnection {
       sessions,
       controls,
     );
+    worktreeMerges.bindDeliveryApproval((versionId) => {
+      const resultId = executions.get(versions.get(versionId).executionId).reviewResultId;
+      if (!resultId) throw new ProjectError('MERGE_CORRECTION_REVIEW', '组合必要修正尚无指定意见');
+      return requireReviewedDelivery(
+        { versions, executions, reviews, reviewResults },
+        versionId,
+        resultId,
+      );
+    });
     const acceptance = new AcceptanceCatalog(
       db,
       workbench,
@@ -356,17 +501,84 @@ export function connectProject(inputRoot: string): ProjectConnection {
       reviews,
       sessions,
     );
+    executions.bindDependencyEvidence((id) => {
+      const ticket = workbench.getTicket(id);
+      if (
+        !ticket.currentExecution ||
+        !['review-passed', 'awaiting-acceptance', 'completed'].includes(ticket.state)
+      )
+        return undefined;
+      const execution = executions.get(ticket.currentExecution);
+      if (!execution.reviewResultId) return undefined;
+      try {
+        const result = reviewResults.get(execution.reviewResultId);
+        const verified = requireReviewedDelivery(
+          { versions, executions, reviews, reviewResults },
+          result.versionId,
+          result.id,
+        );
+        if (
+          verified.version.ticket.id !== ticket.id ||
+          ticketRequirementsHash(ticket) !== ticketRequirementsHash(verified.version.ticket)
+        )
+          return undefined;
+        return {
+          ticketId: id,
+          deliveryId: verified.version.id,
+          reviewId: result.id,
+          scope: result.scope,
+        };
+      } catch (error) {
+        if (error instanceof ProjectError) return undefined;
+        throw error;
+      }
+    });
     messages.bindControlledMessages(
       (id, session) => controls.resultMessage(id, session),
       (id, kind) => controls.controlMessage(id, kind),
     );
     workbench.bindExecutionAccess(
-      (id) => reviews.scopeForSession(id) ?? executions.scopeForSession(id),
+      (id) =>
+        reviews.scopeForSession(id) ??
+        collaborations.scopeForSession(id) ??
+        executions.scopeForSession(id),
     );
     const requireOpen = () => {
       if (closed) throw new ProjectError('CONNECTION_CLOSED', '项目连接已经关闭');
     };
     return {
+      worktrees() {
+        requireOpen();
+        return worktrees;
+      },
+      worktreeMerges() {
+        requireOpen();
+        return worktreeMerges;
+      },
+      localCommits() {
+        requireOpen();
+        return localCommits;
+      },
+      modelPolicies() {
+        requireOpen();
+        return new ModelPolicyCatalog(db, sessions);
+      },
+      decisionRequests() {
+        requireOpen();
+        return decisions;
+      },
+      assistantControls() {
+        requireOpen();
+        return assistantControls;
+      },
+      collaborationResults() {
+        requireOpen();
+        return collaborationResults;
+      },
+      collaborations() {
+        requireOpen();
+        return collaborations;
+      },
       acceptance() {
         requireOpen();
         return acceptance;

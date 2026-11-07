@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';
-import { lstatSync, readdirSync, readFileSync, existsSync, realpathSync } from 'node:fs';
+import { lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
 import { resolve, join, basename } from 'node:path';
 import { z } from 'zod';
 import { withinPath } from './write-scopes.ts';
@@ -236,9 +236,23 @@ export async function windowsProcessSnapshot(): Promise<ProcessSnapshot> {
 }
 export function fingerprintPaths(
   paths: string[],
-  options: { maxFiles?: number; maxBytes?: number; excluded?: string[] } = {},
-): { complete: boolean; digest: string | null; files: number; bytes: number; note: string } {
+  options: {
+    maxFiles?: number;
+    maxBytes?: number;
+    excluded?: string[];
+    excludeGitMetadata?: boolean;
+    retain?: (sha256: string, bytes: Buffer) => void;
+  } = {},
+): {
+  complete: boolean;
+  digest: string | null;
+  files: number;
+  bytes: number;
+  note: string;
+  manifest: { path: string; sha256: string | null }[];
+} {
   const digest = createHash('sha256');
+  const manifest: { path: string; sha256: string | null }[] = [];
   let files = 0,
     bytes = 0;
   const seen = new Set<string>(),
@@ -252,25 +266,29 @@ export function fingerprintPaths(
       }
       if (seen.has(path)) return;
       seen.add(path);
-      if (!existsSync(path)) {
+      const stat = lstatSync(path, { throwIfNoEntry: false });
+      if (!stat) {
         digest.update('missing:' + path + '\n');
+        manifest.push({ path, sha256: null });
         return;
       }
-      const stat = lstatSync(path);
       if (stat.isSymbolicLink()) throw new Error('链接路径不能作为完整观察');
       if (realpathSync(path).toLowerCase() !== path.toLowerCase()) throw new Error('路径已变更');
       if (stat.isDirectory()) {
         digest.update('directory:' + path + '\n');
-        for (const entry of readdirSync(path).sort()) visit(join(path, entry));
+        for (const entry of readdirSync(path).sort())
+          if (!(options.excludeGitMetadata && entry === '.git')) visit(join(path, entry));
       } else if (stat.isFile()) {
         files++;
         bytes += stat.size;
         if (files > (options.maxFiles ?? 10000) || bytes > (options.maxBytes ?? 64 * 1024 * 1024))
           throw new Error('超出观察预算');
-        digest
-          .update('file:' + path + '\n')
-          .update(readFileSync(path))
-          .update('\n');
+        const content = readFileSync(path);
+        if (content.length !== stat.size) throw new Error('文件在读取期间变化');
+        const sha256 = createHash('sha256').update(content).digest('hex');
+        manifest.push({ path, sha256 });
+        options.retain?.(sha256, content);
+        digest.update(JSON.stringify([path, sha256]) + '\n');
       } else throw new Error('非普通文件');
     };
     for (const path of [...paths].sort()) visit(path);
@@ -279,6 +297,7 @@ export function fingerprintPaths(
       digest: digest.digest('hex'),
       files,
       bytes,
+      manifest,
       note: '完整读取指定范围；平台运行数据排除项单独标记，非OS写入锁',
     };
   } catch (error) {
@@ -287,6 +306,7 @@ export function fingerprintPaths(
       digest: null,
       files,
       bytes,
+      manifest: [],
       note: error instanceof Error ? error.message : '范围指纹不可取得',
     };
   }

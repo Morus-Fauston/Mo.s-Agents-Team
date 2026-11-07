@@ -61,6 +61,23 @@ export function ticketRequirementsHash(ticket: TicketRecord): string {
         verification: item.verification,
       }))
       .sort((a, b) => a.id.localeCompare(b.id)),
+    ...(ticket.kind === 'research'
+      ? {
+          research: {
+            body: ticket.research?.body ?? '',
+            questions: (ticket.research?.questions ?? [])
+              .map((q) => ({
+                id: q.id,
+                title: q.title,
+                question: q.question,
+                condition: q.condition,
+                sources: q.sources,
+                definitionRevision: q.definitionRevision,
+              }))
+              .sort((a, b) => a.id.localeCompare(b.id)),
+          },
+        }
+      : {}),
   });
 }
 export class AcceptanceCatalog {
@@ -180,6 +197,21 @@ export class AcceptanceCatalog {
       .prepare('SELECT data FROM acceptance_result WHERE assignment_id=?')
       .get(assignmentId);
     return row ? acceptanceRecordSchema.parse(JSON.parse(String(row.data))) : undefined;
+  }
+  historyReference(id: string): { ticketId: string; label: string } | undefined {
+    const assignment = this.db
+      .prepare('SELECT ticket_id FROM acceptance_assignment WHERE id=?')
+      .get(id);
+    if (assignment) return { ticketId: String(assignment.ticket_id), label: '原验收安排' };
+    const result = this.db
+      .prepare(
+        'SELECT a.ticket_id FROM acceptance_result r JOIN acceptance_assignment a ON a.id=r.assignment_id WHERE r.id=?',
+      )
+      .get(id);
+    if (result) return { ticketId: String(result.ticket_id), label: '原指定验收结果' };
+    const accepted = this.db.prepare('SELECT ticket_id FROM ticket_acceptance WHERE id=?').get(id);
+    if (accepted) return { ticketId: String(accepted.ticket_id), label: '原主管整票接受' };
+    return undefined;
   }
   assignments(ticketId?: string): AcceptanceAssignment[] {
     return (
